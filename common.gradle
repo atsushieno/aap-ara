@@ -1,0 +1,38 @@
+
+android {
+    compileSdk = libs.versions.android.compileSdk.get().toInteger()
+    buildToolsVersion = libs.versions.build.tools.get()
+
+    defaultConfig {
+        minSdk = libs.versions.android.minSdk.get().toInteger()
+        targetSdk = libs.versions.android.targetSdk.get().toInteger()
+        versionCode = 1
+        versionName = libs.versions.aap.core.get()
+
+        consumerProguardFiles ("consumer-rules.pro")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // This should not be necessary in normal projects, but we specify c++_shared and thus
+    // ODR hits us. We specify ANDROID_STL=c++_shared in favor of prefab (which is not enabled
+    // yet but will be at some stage). This means, every AAP related project has to fix the
+    // NDK version in use. It is not realistic when it becomes for public uses, but so far
+    // we have to take this pill...
+    //ndkVersion = "21.4.7075529"
+    ndkVersion = libs.versions.ndk.get()
+    buildFeatures {
+        prefab = true
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+kotlin {
+    jvmToolchain(17)
+}

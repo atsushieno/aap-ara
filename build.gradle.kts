@@ -1,0 +1,22 @@
+plugins {
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.android.library) apply false
+    alias(libs.plugins.kotlin.android) apply false
+    alias(libs.plugins.dokka) apply false
+    alias(libs.plugins.vanniktech.maven.publish) apply false
+}
+
+subprojects {
+    group = "org.androidaudioplugin"
+    repositories {
+        google()
+        mavenLocal()
+        mavenCentral()
+        maven("https://plugins.gradle.org/m2/")
+        maven("https://jitpack.io")
+    }
+}
+
+tasks.register<Delete>("clean") {
+    delete(rootProject.buildDir)
+}

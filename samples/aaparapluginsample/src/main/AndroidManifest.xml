@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:label="@string/app_name"
+        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service
+            android:name="org.androidaudioplugin.AudioPluginService"
+            android:exported="true"
+            android:label="AAP ARA Plugin Sample"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="org.androidaudioplugin.AudioPluginService.V4" />
+            </intent-filter>
+            <meta-data
+                android:name="org.androidaudioplugin.AudioPluginService.V4#Plugins"
+                android:resource="@xml/aap_metadata" />
+            <meta-data
+                android:name="org.androidaudioplugin.AudioPluginService.V4#Extensions"
+                android:value="org.androidaudioplugin.ara.AraAudioPluginServiceExtension" />
+        </service>
+    </application>
+</manifest>

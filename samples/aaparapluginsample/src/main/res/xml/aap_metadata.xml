@@ -1,0 +1,16 @@
+<plugins xmlns="urn:org.androidaudioplugin.core">
+  <plugin
+      name="AAP ARA Plugin Sample"
+      category="Effect"
+      developer="AAP Developers"
+      unique-id="urn:org.androidaudioplugin/samples/aaparapluginsample/EffectSample"
+      library="libaap-ara-plugin-sample.so">
+    <ports>
+      <port direction="output" content="audio" name="Analysis Out L" />
+      <port direction="output" content="audio" name="Analysis Out R" />
+    </ports>
+    <extensions>
+      <extension uri="urn://androidaudioplugin.org/extensions/ara/v1" />
+    </extensions>
+  </plugin>
+</plugins>
