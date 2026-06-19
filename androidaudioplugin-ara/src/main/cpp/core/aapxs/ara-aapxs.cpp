@@ -397,22 +397,33 @@ AAPXSExtensionServiceProxy aap::xs::AAPXSDefinition_Ara::aapxs_ara_get_host_prox
     return service->service_proxy;
 }
 
+void aap::xs::AraClientAAPXS::invokeVoidEdit(int32_t opcode) {
+    auto result = callAndWait<bool>(opcode, [](AAPXSSerializationContext*) { return true; });
+    if (!result.isOk())
+        aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA model edit (opcode %d) failed: %s",
+                     opcode, result.error.c_str());
+}
+
 void aap::xs::AraClientAAPXS::getFactoryCapability(aap_ara_factory_capability_t& destination) {
     memset(serialization->data, 0, sizeof(aap_ara_factory_capability_t));
     serialization->data_size = 0;
-    callVoidFunctionSynchronously(OPCODE_ARA_GET_FACTORY_CAPABILITY);
-    destination = *asWire<aap_ara_factory_capability_t>(serialization);
+    auto result = callAndWait<aap_ara_factory_capability_t>(OPCODE_ARA_GET_FACTORY_CAPABILITY,
+            [](AAPXSSerializationContext* ctx) { return *asWire<aap_ara_factory_capability_t>(ctx); });
+    if (result.isOk())
+        destination = result.value;
+    else
+        aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA getFactoryCapability failed: %s", result.error.c_str());
 }
 
 void aap::xs::AraClientAAPXS::beginModelUpdate(uint32_t flags) {
     *asWire<aap_ara_begin_model_update_wire_t>(serialization) = aap_ara_begin_model_update_wire_t{flags};
     serialization->data_size = sizeof(aap_ara_begin_model_update_wire_t);
-    callVoidFunctionSynchronously(OPCODE_ARA_BEGIN_MODEL_UPDATE);
+    invokeVoidEdit(OPCODE_ARA_BEGIN_MODEL_UPDATE);
 }
 
 void aap::xs::AraClientAAPXS::endModelUpdate() {
     serialization->data_size = 0;
-    callVoidFunctionSynchronously(OPCODE_ARA_END_MODEL_UPDATE);
+    invokeVoidEdit(OPCODE_ARA_END_MODEL_UPDATE);
 }
 
 void aap::xs::AraClientAAPXS::createDocument(aap_ara_document_id_t documentId, const aap_ara_document_properties_t* properties) {
@@ -421,7 +432,7 @@ void aap::xs::AraClientAAPXS::createDocument(aap_ara_document_id_t documentId, c
     wire.document_id = documentId;
     packDocumentProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_CREATE_DOCUMENT);
+    invokeVoidEdit(OPCODE_ARA_CREATE_DOCUMENT);
 }
 
 void aap::xs::AraClientAAPXS::updateDocumentProperties(aap_ara_document_id_t documentId, const aap_ara_document_properties_t* properties) {
@@ -430,13 +441,13 @@ void aap::xs::AraClientAAPXS::updateDocumentProperties(aap_ara_document_id_t doc
     wire.document_id = documentId;
     packDocumentProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_UPDATE_DOCUMENT_PROPERTIES);
+    invokeVoidEdit(OPCODE_ARA_UPDATE_DOCUMENT_PROPERTIES);
 }
 
 void aap::xs::AraClientAAPXS::destroyDocument(aap_ara_document_id_t documentId) {
     asWire<aap_ara_object_id_wire_t>(serialization)->object_id = documentId;
     serialization->data_size = sizeof(aap_ara_object_id_wire_t);
-    callVoidFunctionSynchronously(OPCODE_ARA_DESTROY_DOCUMENT);
+    invokeVoidEdit(OPCODE_ARA_DESTROY_DOCUMENT);
 }
 
 void aap::xs::AraClientAAPXS::createMusicalContext(aap_ara_document_id_t documentId, aap_ara_musical_context_id_t musicalContextId, const aap_ara_musical_context_properties_t* properties) {
@@ -446,7 +457,7 @@ void aap::xs::AraClientAAPXS::createMusicalContext(aap_ara_document_id_t documen
     wire.musical_context_id = musicalContextId;
     packMusicalContextProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_CREATE_MUSICAL_CONTEXT);
+    invokeVoidEdit(OPCODE_ARA_CREATE_MUSICAL_CONTEXT);
 }
 
 void aap::xs::AraClientAAPXS::updateMusicalContextProperties(aap_ara_musical_context_id_t musicalContextId, const aap_ara_musical_context_properties_t* properties) {
@@ -455,13 +466,13 @@ void aap::xs::AraClientAAPXS::updateMusicalContextProperties(aap_ara_musical_con
     wire.musical_context_id = musicalContextId;
     packMusicalContextProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_UPDATE_MUSICAL_CONTEXT_PROPERTIES);
+    invokeVoidEdit(OPCODE_ARA_UPDATE_MUSICAL_CONTEXT_PROPERTIES);
 }
 
 void aap::xs::AraClientAAPXS::destroyMusicalContext(aap_ara_musical_context_id_t musicalContextId) {
     asWire<aap_ara_object_id_wire_t>(serialization)->object_id = musicalContextId;
     serialization->data_size = sizeof(aap_ara_object_id_wire_t);
-    callVoidFunctionSynchronously(OPCODE_ARA_DESTROY_MUSICAL_CONTEXT);
+    invokeVoidEdit(OPCODE_ARA_DESTROY_MUSICAL_CONTEXT);
 }
 
 void aap::xs::AraClientAAPXS::createRegionSequence(aap_ara_document_id_t documentId, aap_ara_region_sequence_id_t regionSequenceId, const aap_ara_region_sequence_properties_t* properties) {
@@ -471,7 +482,7 @@ void aap::xs::AraClientAAPXS::createRegionSequence(aap_ara_document_id_t documen
     wire.region_sequence_id = regionSequenceId;
     packRegionSequenceProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_CREATE_REGION_SEQUENCE);
+    invokeVoidEdit(OPCODE_ARA_CREATE_REGION_SEQUENCE);
 }
 
 void aap::xs::AraClientAAPXS::updateRegionSequenceProperties(aap_ara_region_sequence_id_t regionSequenceId, const aap_ara_region_sequence_properties_t* properties) {
@@ -480,13 +491,13 @@ void aap::xs::AraClientAAPXS::updateRegionSequenceProperties(aap_ara_region_sequ
     wire.region_sequence_id = regionSequenceId;
     packRegionSequenceProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_UPDATE_REGION_SEQUENCE_PROPERTIES);
+    invokeVoidEdit(OPCODE_ARA_UPDATE_REGION_SEQUENCE_PROPERTIES);
 }
 
 void aap::xs::AraClientAAPXS::destroyRegionSequence(aap_ara_region_sequence_id_t regionSequenceId) {
     asWire<aap_ara_object_id_wire_t>(serialization)->object_id = regionSequenceId;
     serialization->data_size = sizeof(aap_ara_object_id_wire_t);
-    callVoidFunctionSynchronously(OPCODE_ARA_DESTROY_REGION_SEQUENCE);
+    invokeVoidEdit(OPCODE_ARA_DESTROY_REGION_SEQUENCE);
 }
 
 void aap::xs::AraClientAAPXS::createAudioSource(aap_ara_document_id_t documentId, aap_ara_audio_source_id_t audioSourceId, const aap_ara_audio_source_properties_t* properties) {
@@ -496,7 +507,7 @@ void aap::xs::AraClientAAPXS::createAudioSource(aap_ara_document_id_t documentId
     wire.audio_source_id = audioSourceId;
     packAudioSourceProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_CREATE_AUDIO_SOURCE);
+    invokeVoidEdit(OPCODE_ARA_CREATE_AUDIO_SOURCE);
 }
 
 void aap::xs::AraClientAAPXS::updateAudioSourceProperties(aap_ara_audio_source_id_t audioSourceId, const aap_ara_audio_source_properties_t* properties) {
@@ -505,7 +516,7 @@ void aap::xs::AraClientAAPXS::updateAudioSourceProperties(aap_ara_audio_source_i
     wire.audio_source_id = audioSourceId;
     packAudioSourceProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_UPDATE_AUDIO_SOURCE_PROPERTIES);
+    invokeVoidEdit(OPCODE_ARA_UPDATE_AUDIO_SOURCE_PROPERTIES);
 }
 
 void aap::xs::AraClientAAPXS::enableAudioSourceSamplesAccess(aap_ara_audio_source_id_t audioSourceId, bool enable) {
@@ -516,7 +527,7 @@ void aap::xs::AraClientAAPXS::enableAudioSourceSamplesAccess(aap_ara_audio_sourc
     wire.audio_source_id = audioSourceId;
     wire.enable = enable;
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_ENABLE_AUDIO_SOURCE_SAMPLES_ACCESS);
+    invokeVoidEdit(OPCODE_ARA_ENABLE_AUDIO_SOURCE_SAMPLES_ACCESS);
     aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
                  "enableAudioSourceSamplesAccess end audioSourceId=%d enable=%d",
                  audioSourceId, enable ? 1 : 0);
@@ -531,7 +542,7 @@ void aap::xs::AraClientAAPXS::notifyAudioSourceContentChanged(aap_ara_audio_sour
     wire.changed_start_sample = changedStartSample;
     wire.changed_sample_count = changedSampleCount;
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_NOTIFY_AUDIO_SOURCE_CONTENT_CHANGED);
+    invokeVoidEdit(OPCODE_ARA_NOTIFY_AUDIO_SOURCE_CONTENT_CHANGED);
     aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
                  "notifyAudioSourceContentChanged end audioSourceId=%d start=%d count=%d",
                  audioSourceId, changedStartSample, changedSampleCount);
@@ -540,7 +551,7 @@ void aap::xs::AraClientAAPXS::notifyAudioSourceContentChanged(aap_ara_audio_sour
 void aap::xs::AraClientAAPXS::destroyAudioSource(aap_ara_audio_source_id_t audioSourceId) {
     asWire<aap_ara_object_id_wire_t>(serialization)->object_id = audioSourceId;
     serialization->data_size = sizeof(aap_ara_object_id_wire_t);
-    callVoidFunctionSynchronously(OPCODE_ARA_DESTROY_AUDIO_SOURCE);
+    invokeVoidEdit(OPCODE_ARA_DESTROY_AUDIO_SOURCE);
 }
 
 void aap::xs::AraClientAAPXS::createAudioModification(aap_ara_audio_source_id_t audioSourceId, aap_ara_audio_modification_id_t audioModificationId, const aap_ara_audio_modification_properties_t* properties) {
@@ -550,7 +561,7 @@ void aap::xs::AraClientAAPXS::createAudioModification(aap_ara_audio_source_id_t 
     wire.audio_modification_id = audioModificationId;
     packAudioModificationProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_CREATE_AUDIO_MODIFICATION);
+    invokeVoidEdit(OPCODE_ARA_CREATE_AUDIO_MODIFICATION);
 }
 
 void aap::xs::AraClientAAPXS::updateAudioModificationProperties(aap_ara_audio_modification_id_t audioModificationId, const aap_ara_audio_modification_properties_t* properties) {
@@ -559,13 +570,13 @@ void aap::xs::AraClientAAPXS::updateAudioModificationProperties(aap_ara_audio_mo
     wire.audio_modification_id = audioModificationId;
     packAudioModificationProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_UPDATE_AUDIO_MODIFICATION_PROPERTIES);
+    invokeVoidEdit(OPCODE_ARA_UPDATE_AUDIO_MODIFICATION_PROPERTIES);
 }
 
 void aap::xs::AraClientAAPXS::destroyAudioModification(aap_ara_audio_modification_id_t audioModificationId) {
     asWire<aap_ara_object_id_wire_t>(serialization)->object_id = audioModificationId;
     serialization->data_size = sizeof(aap_ara_object_id_wire_t);
-    callVoidFunctionSynchronously(OPCODE_ARA_DESTROY_AUDIO_MODIFICATION);
+    invokeVoidEdit(OPCODE_ARA_DESTROY_AUDIO_MODIFICATION);
 }
 
 void aap::xs::AraClientAAPXS::createPlaybackRegion(aap_ara_audio_modification_id_t audioModificationId, aap_ara_playback_region_id_t playbackRegionId, const aap_ara_playback_region_properties_t* properties) {
@@ -575,7 +586,7 @@ void aap::xs::AraClientAAPXS::createPlaybackRegion(aap_ara_audio_modification_id
     wire.playback_region_id = playbackRegionId;
     packPlaybackRegionProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_CREATE_PLAYBACK_REGION);
+    invokeVoidEdit(OPCODE_ARA_CREATE_PLAYBACK_REGION);
 }
 
 void aap::xs::AraClientAAPXS::updatePlaybackRegionProperties(aap_ara_playback_region_id_t playbackRegionId, const aap_ara_playback_region_properties_t* properties) {
@@ -584,20 +595,25 @@ void aap::xs::AraClientAAPXS::updatePlaybackRegionProperties(aap_ara_playback_re
     wire.playback_region_id = playbackRegionId;
     packPlaybackRegionProperties(wire.properties, properties);
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_UPDATE_PLAYBACK_REGION_PROPERTIES);
+    invokeVoidEdit(OPCODE_ARA_UPDATE_PLAYBACK_REGION_PROPERTIES);
 }
 
 void aap::xs::AraClientAAPXS::destroyPlaybackRegion(aap_ara_playback_region_id_t playbackRegionId) {
     asWire<aap_ara_object_id_wire_t>(serialization)->object_id = playbackRegionId;
     serialization->data_size = sizeof(aap_ara_object_id_wire_t);
-    callVoidFunctionSynchronously(OPCODE_ARA_DESTROY_PLAYBACK_REGION);
+    invokeVoidEdit(OPCODE_ARA_DESTROY_PLAYBACK_REGION);
 }
 
 void aap::xs::AraServiceAAPXS::getHostCapability(aap_ara_host_capability_t& destination) {
     memset(serialization->data, 0, sizeof(aap_ara_host_capability_t));
     serialization->data_size = 0;
-    callVoidFunctionSynchronously(OPCODE_ARA_GET_HOST_CAPABILITY);
-    destination = *asWire<aap_ara_host_capability_t>(serialization);
+    // Blocking-sync on the async core: gains a request timeout and a host-reported error channel.
+    auto result = callAndWait<aap_ara_host_capability_t>(OPCODE_ARA_GET_HOST_CAPABILITY,
+            [](AAPXSSerializationContext* ctx) { return *asWire<aap_ara_host_capability_t>(ctx); });
+    if (result.isOk())
+        destination = result.value;
+    else
+        aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA getHostCapability failed: %s", result.error.c_str());
 }
 
 void aap::xs::AraServiceAAPXS::readAudioSourceSamples(aap_ara_audio_source_id_t audioSourceId, const aap_ara_audio_source_sample_range_t* sampleRange, aap_ara_audio_source_samples_buffer_t* destination) {
@@ -606,8 +622,12 @@ void aap::xs::AraServiceAAPXS::readAudioSourceSamples(aap_ara_audio_source_id_t 
     wire.audio_source_id = audioSourceId;
     wire.sample_range = sampleRange ? *sampleRange : aap_ara_audio_source_sample_range_t{};
     serialization->data_size = sizeof(wire);
-    callVoidFunctionSynchronously(OPCODE_ARA_READ_AUDIO_SOURCE_SAMPLES);
-    if (destination) {
+    auto result = callAndWait<bool>(OPCODE_ARA_READ_AUDIO_SOURCE_SAMPLES,
+            [](AAPXSSerializationContext*) { return true; });
+    if (!result.isOk())
+        aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA readAudioSourceSamples failed: %s", result.error.c_str());
+    // Binder-only synchronous call: the serialization buffer stays valid until the caller copies out.
+    if (result.isOk() && destination) {
         destination->struct_size = sizeof(aap_ara_audio_source_samples_buffer_t);
         destination->data = reinterpret_cast<uint8_t*>(serialization->data) + sizeof(aap_ara_read_audio_source_samples_wire_t);
         destination->data_size = wire.result_data_size;

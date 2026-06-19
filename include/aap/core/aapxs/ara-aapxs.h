@@ -252,6 +252,11 @@ namespace aap::xs {
                 staticDestroyPlaybackRegion
         };
 
+        // Synchronously invokes a void model-edit command and logs any failure/timeout. The
+        // aap_ara_extension_t functions return void, so the error cannot be propagated further;
+        // logging is the only in-API way to surface it.
+        void invokeVoidEdit(int32_t opcode);
+
     public:
         AraClientAAPXS(AAPXSInitiatorInstance* initiatorInstance, AAPXSSerializationContext* serialization)
                 : TypedAAPXS(AAP_ARA_EXTENSION_URI, initiatorInstance, serialization) {}
@@ -346,7 +351,12 @@ namespace aap::xs {
                                   aapxs_ara_process_incoming_plugin_aapxs_reply,
                                   aapxs_ara_process_incoming_host_aapxs_reply,
                                   aapxs_ara_get_plugin_proxy,
-                                  aapxs_ara_get_host_proxy};
+                                  aapxs_ara_get_host_proxy,
+                                  // is_command_rt_safe == nullptr: ARA is Binder-only. ARA model
+                                  // edits/reads are not real-time and (e.g. readAudioSourceSamples)
+                                  // can transfer large payloads, so they must never take the SysEx8
+                                  // realtime path. They are invoked asynchronously over Binder.
+                                  nullptr};
 
     public:
         AAPXSDefinition& asPublic() override { return aapxs_ara; }

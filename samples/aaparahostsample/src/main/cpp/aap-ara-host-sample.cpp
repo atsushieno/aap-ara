@@ -208,7 +208,8 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Registry prepared with standard + ARA extensions");
         auto* client = new aap::PluginClient(connections, &pluginList, registry);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "PluginClient created");
-        auto result = client->createInstance(pluginIdString, sampleRate, true);
+        // createInstance() no longer takes sampleRate (it is passed to prepare() below).
+        auto result = client->createInstance(pluginIdString, true);
         aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
                      "createInstance returned instanceId=%d error=%s",
                      result.value, result.error.c_str());
