@@ -1,5 +1,9 @@
+#include <jni.h>
 #include <aap/android-audio-plugin.h>
+#include <aap/core/host/plugin-host.h>
+#include <memory>
 #include <aap/ext/ara.h>
+#include <aap/ext/plugin-info.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -13,6 +17,27 @@
 #include "aap/unstable/logging.h"
 
 #define LOG_TAG "AAP.ARA.PluginSample"
+
+namespace {
+struct PublishedModel { std::mutex mutex; std::string json = "{}"; uint64_t revision = 0; };
+std::mutex snapshots_mutex;
+uint64_t next_snapshot_token = 1;
+std::map<uint64_t, std::shared_ptr<PublishedModel>> snapshots;
+std::map<AndroidAudioPlugin*, uint64_t> plugin_snapshot_tokens;
+std::string json_string(const std::string& text) {
+    std::ostringstream out;
+    out << '"';
+    for (unsigned char c : text) {
+        if (c == '"' || c == '\\') out << '\\' << c;
+        else if (c < 32) {
+            const char* hex = "0123456789abcdef";
+            out << "\\u00" << hex[c >> 4] << hex[c & 15];
+        } else out << c;
+    }
+    out << '"';
+    return out.str();
+}
+}
 
 extern "C" {
 
@@ -61,6 +86,8 @@ struct PlaybackRegionEntity {
 
 struct SamplePluginContext {
     AndroidAudioPluginHost host;
+    std::string plugin_id;
+    std::array<int32_t, 2> audio_output_ports{0, 1};
     bool model_update_active{};
     uint32_t last_model_update_flags{};
     bool sample_access_enabled{};
@@ -71,6 +98,8 @@ struct SamplePluginContext {
     std::array<float, 4> post_change_output_r{};
     std::string analysis_summary;
     std::mutex analysis_mutex;
+    std::shared_ptr<PublishedModel> published = std::make_shared<PublishedModel>();
+    uint64_t content_changes = 0;
     std::map<aap_ara_document_id_t, NamedEntity> documents;
     std::map<aap_ara_musical_context_id_t, MusicalContextEntity> musical_contexts;
     std::map<aap_ara_region_sequence_id_t, RegionSequenceEntity> region_sequences;
@@ -78,11 +107,52 @@ struct SamplePluginContext {
     std::map<aap_ara_audio_modification_id_t, AudioModificationEntity> audio_modifications;
     std::map<aap_ara_playback_region_id_t, PlaybackRegionEntity> playback_regions;
 
-    explicit SamplePluginContext(AndroidAudioPluginHost* host_) : host(*host_) {}
+    explicit SamplePluginContext(AndroidAudioPluginHost* host_, const char* id) : host(*host_), plugin_id(id ? id : "") {}
 };
 
 static SamplePluginContext* get_context(AndroidAudioPlugin* plugin) {
     return static_cast<SamplePluginContext*>(plugin->plugin_specific);
+}
+
+// Publish only completed transactions. The UI reads this immutable copy and
+// never touches the live ARA maps or holds a lock across reverse host callbacks.
+static void publish_model(SamplePluginContext* context) {
+    auto& snapshot = *context->published;
+    std::lock_guard<std::mutex> lock(snapshot.mutex);
+    std::ostringstream out;
+    out.precision(17);
+    out << "{\"revision\":" << ++snapshot.revision << ",\"contentChanges\":" << context->content_changes;
+    out << ",\"title\":" << json_string(context->documents.empty() ? "No ARA document" : context->documents.begin()->second.name);
+    out << ",\"tracks\":[";
+    bool comma = false;
+    for (auto& [id, track] : context->region_sequences) {
+        if (comma) out << ',';
+        comma = true;
+        out << "{\"id\":" << id << ",\"name\":" << json_string(track.name) << ",\"order\":" << track.order_index << '}';
+    }
+    out << "],\"clips\":[";
+    comma = false;
+    for (auto& [id, clip] : context->playback_regions) {
+        if (comma) out << ',';
+        comma = true;
+        auto modification = context->audio_modifications.find(clip.audio_modification_id);
+        int source = modification == context->audio_modifications.end() ? 0 : modification->second.audio_source_id;
+        out << "{\"id\":" << id << ",\"track\":" << clip.region_sequence_id << ",\"name\":" << json_string(clip.name)
+            << ",\"start\":" << clip.start_in_playback_time << ",\"offset\":" << clip.start_in_modification_time
+            << ",\"duration\":" << clip.duration_in_playback_time << ",\"sourceId\":" << source << '}';
+    }
+    out << "],\"sources\":[";
+    comma = false;
+    for (auto& [id, source] : context->audio_sources) {
+        if (comma) out << ',';
+        comma = true;
+        out << "{\"id\":" << id << ",\"name\":" << json_string(source.name) << ",\"sampleCount\":" << source.sample_count
+            << ",\"sampleRate\":" << source.sample_rate << ",\"access\":" << (source.samples_access_enabled ? "true" : "false")
+            << ",\"changedStart\":" << source.changed_start_sample << ",\"changedCount\":" << source.changed_sample_count << '}';
+    }
+    std::lock_guard<std::mutex> analysis_lock(context->analysis_mutex);
+    out << "],\"analysis\":" << json_string(context->analysis_summary) << '}';
+    snapshot.json = out.str();
 }
 
 static std::string copy_nullable_string(const char* value) {
@@ -165,8 +235,9 @@ static void analyze_audio_range(
         throw std::runtime_error("Host returned unexpected sample format");
     if (destination.channel_count < 2)
         throw std::runtime_error("Host returned fewer than 2 channels");
-    if (destination.sample_count <= 0)
-        throw std::runtime_error("Host returned no audio samples");
+    if (!destination.data || destination.sample_count < 2 ||
+        destination.data_size < static_cast<size_t>(destination.sample_count) * 2 * sizeof(float))
+        throw std::runtime_error("Host returned an incomplete stereo sample buffer");
 
     auto* base = static_cast<const float*>(destination.data);
     auto frames = destination.sample_count;
@@ -181,8 +252,12 @@ static void analyze_audio_range(
        << ") left=(" << out_left[0] << ", " << out_left[1] << ", rms=" << out_left[2]
        << ", peak=" << out_left[3] << ") right=(" << out_right[0] << ", " << out_right[1]
        << ", rms=" << out_right[2] << ", peak=" << out_right[3] << ")";
-    context->analysis_summary = ss.str();
-    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG, "analyze_audio_range end summary=%s", context->analysis_summary.c_str());
+    auto summary = ss.str();
+    {
+        std::lock_guard<std::mutex> lock(context->analysis_mutex);
+        context->analysis_summary = summary;
+    }
+    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG, "analyze_audio_range end summary=%s", summary.c_str());
 }
 
 static void run_analysis(
@@ -235,6 +310,7 @@ static void sample_begin_model_update(aap_ara_extension_t*, AndroidAudioPlugin* 
 static void sample_end_model_update(aap_ara_extension_t*, AndroidAudioPlugin* plugin) {
     auto* context = get_context(plugin);
     context->model_update_active = false;
+    publish_model(context);
 }
 
 static void sample_create_document(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_document_id_t documentId, const aap_ara_document_properties_t* properties) {
@@ -324,6 +400,7 @@ static void sample_enable_audio_source_samples_access(aap_ara_extension_t*, Andr
     context->sample_access_enabled = enable;
     if (enable)
         run_analysis(context, audioSourceId, false);
+    if (!context->model_update_active) publish_model(context);
 }
 
 static void sample_notify_audio_source_content_changed(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_source_id_t audioSourceId, aap_ara_sample_position_t startSample, aap_ara_sample_count_t sampleCount) {
@@ -332,10 +409,12 @@ static void sample_notify_audio_source_content_changed(aap_ara_extension_t*, And
                  "notify_audio_source_content_changed audioSourceId=%d start=%d count=%d sampleAccess=%d",
                  audioSourceId, startSample, sampleCount, context->sample_access_enabled ? 1 : 0);
     auto& source = context->audio_sources[audioSourceId];
+    ++context->content_changes;
     source.changed_start_sample = startSample;
     source.changed_sample_count = sampleCount;
-    if (context->sample_access_enabled)
+    if (source.samples_access_enabled)
         run_analysis(context, audioSourceId, true);
+    if (!context->model_update_active) publish_model(context);
 }
 
 static void sample_destroy_audio_source(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_source_id_t audioSourceId) {
@@ -417,45 +496,45 @@ static aap_ara_extension_t sample_ara_extension{
         sample_destroy_playback_region
 };
 
-static void sample_prepare(AndroidAudioPlugin*, int32_t, aap_buffer_t*) {}
+static void sample_prepare(AndroidAudioPlugin* plugin, int32_t, aap_buffer_t*) {
+    auto* context = get_context(plugin);
+    auto* info_extension = context->host.get_extension
+        ? static_cast<aap_host_plugin_info_extension_t*>(context->host.get_extension(&context->host, AAP_PLUGIN_INFO_EXTENSION_URI))
+        : nullptr;
+    if (!info_extension || !info_extension->get) return;
+    auto info = info_extension->get(info_extension, &context->host, context->plugin_id.c_str());
+    if (!info.plugin_id || !info.get_port_count || !info.get_port) return;
+    context->audio_output_ports = {-1, -1};
+    int output = 0;
+    for (int i = 0, n = info.get_port_count(&info); i < n && output < 2; ++i) {
+        auto port = info.get_port(&info, i);
+        if (port.content_type(&port) == AAP_CONTENT_TYPE_AUDIO && port.direction(&port) == AAP_PORT_DIRECTION_OUTPUT)
+            context->audio_output_ports[output++] = i;
+    }
+}
 static void sample_activate(AndroidAudioPlugin*) {}
 static void sample_deactivate(AndroidAudioPlugin*) {}
 static void sample_process(AndroidAudioPlugin* plugin, aap_buffer_t* buffer, int32_t frameCount, int64_t) {
     auto* context = get_context(plugin);
-    std::lock_guard<std::mutex> lock(context->analysis_mutex);
-    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                 "process frameCount=%d preL0=%f postL0=%f preR0=%f postR0=%f",
-                 frameCount,
-                 context->pre_change_output_l[0], context->post_change_output_l[0],
-                 context->pre_change_output_r[0], context->post_change_output_r[0]);
-    for (int32_t i = 0, n = buffer->num_ports(buffer); i < n; ++i) {
-        auto* data = static_cast<float*>(buffer->get_buffer(buffer, i));
-        if (!data)
-            continue;
-        auto size = buffer->get_buffer_size(buffer, i);
-        memset(data, 0, size);
+    std::array<std::array<float, 4>, 2> pre, post;
+    {
+        std::lock_guard<std::mutex> lock(context->analysis_mutex);
+        pre = {context->pre_change_output_l, context->pre_change_output_r};
+        post = {context->post_change_output_l, context->post_change_output_r};
     }
-
-    int output_index = 0;
-    for (int32_t i = 0, n = buffer->num_ports(buffer); i < n; ++i) {
-        auto* data = static_cast<float*>(buffer->get_buffer(buffer, i));
-        if (!data)
-            continue;
-        if (output_index == 0) {
-            auto values = std::min<int32_t>(frameCount, 8);
-            for (int32_t f = 0; f < values && f < 4; ++f)
-                data[f] = context->pre_change_output_l[f];
-            for (int32_t f = 4; f < values && f < 8; ++f)
-                data[f] = context->post_change_output_l[f - 4];
-        } else if (output_index == 1) {
-            auto values = std::min<int32_t>(frameCount, 8);
-            for (int32_t f = 0; f < values && f < 4; ++f)
-                data[f] = context->pre_change_output_r[f];
-            for (int32_t f = 4; f < values && f < 8; ++f)
-                data[f] = context->post_change_output_r[f - 4];
-        } else
-            continue;
-        ++output_index;
+    // Leave MIDI/AAPXS transport buffers intact. Hosts may inject these ports in
+    // addition to the two audio outputs declared by the sample metadata.
+    for (int output = 0; output < 2; ++output) {
+        int port = context->audio_output_ports[output];
+        if (port < 0 || port >= buffer->num_ports(buffer)) continue;
+        auto* data = static_cast<float*>(buffer->get_buffer(buffer, port));
+        if (!data) continue;
+        auto bytes = buffer->get_buffer_size(buffer, port);
+        memset(data, 0, bytes);
+        auto values = std::min<int32_t>(std::max<int32_t>(0, frameCount),
+                                      std::min<size_t>(8, bytes / sizeof(float)));
+        for (int f = 0; f < values; ++f)
+            data[f] = f < 4 ? pre[output][f] : post[output][f - 4];
     }
 }
 
@@ -465,9 +544,15 @@ static void* sample_get_extension(AndroidAudioPlugin*, const char* uri) {
     return nullptr;
 }
 
-static AndroidAudioPlugin* sample_instantiate(AndroidAudioPluginFactory*, const char*, AndroidAudioPluginHost* host) {
+static AndroidAudioPlugin* sample_instantiate(AndroidAudioPluginFactory*, const char* pluginId, AndroidAudioPluginHost* host) {
     auto* plugin = new AndroidAudioPlugin();
-    plugin->plugin_specific = new SamplePluginContext(host);
+    plugin->plugin_specific = new SamplePluginContext(host, pluginId);
+    {
+        std::lock_guard<std::mutex> lock(snapshots_mutex);
+        auto token = next_snapshot_token++;
+        snapshots[token] = get_context(plugin)->published;
+        plugin_snapshot_tokens[plugin] = token;
+    }
     plugin->prepare = sample_prepare;
     plugin->activate = sample_activate;
     plugin->process = sample_process;
@@ -478,6 +563,14 @@ static AndroidAudioPlugin* sample_instantiate(AndroidAudioPluginFactory*, const 
 }
 
 static void sample_release(AndroidAudioPluginFactory*, AndroidAudioPlugin* instance) {
+    {
+        std::lock_guard<std::mutex> lock(snapshots_mutex);
+        auto found = plugin_snapshot_tokens.find(instance);
+        if (found != plugin_snapshot_tokens.end()) {
+            snapshots.erase(found->second);
+            plugin_snapshot_tokens.erase(found);
+        }
+    }
     delete static_cast<SamplePluginContext*>(instance->plugin_specific);
     delete instance;
 }
@@ -492,4 +585,29 @@ AndroidAudioPluginFactory* GetAndroidAudioPluginFactory() {
     return &factory;
 }
 
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_resolveSnapshot(
+        JNIEnv*, jobject, jlong servicePointer, jint instanceId) {
+    auto* service = reinterpret_cast<aap::PluginService*>(servicePointer);
+    auto* instance = service ? service->getLocalInstance(instanceId) : nullptr;
+    if (!instance) return 0;
+    std::lock_guard<std::mutex> lock(snapshots_mutex);
+    auto found = plugin_snapshot_tokens.find(instance->getPlugin());
+    return found == plugin_snapshot_tokens.end() ? 0 : found->second;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_snapshot(
+        JNIEnv* env, jobject, jlong token) {
+    std::shared_ptr<PublishedModel> model;
+    {
+        std::lock_guard<std::mutex> lock(snapshots_mutex);
+        auto found = snapshots.find(token);
+        if (found == snapshots.end()) return env->NewStringUTF("null");
+        model = found->second;
+    }
+    std::lock_guard<std::mutex> lock(model->mutex);
+    return env->NewStringUTF(model->json.c_str());
 }

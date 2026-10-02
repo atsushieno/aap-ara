@@ -1,10 +1,13 @@
-<plugins xmlns="urn:org.androidaudioplugin.core">
+<plugins xmlns="urn:org.androidaudioplugin.core"
+    xmlns:gui="urn://androidaudioplugin.org/extensions/gui">
   <plugin
       name="AAP ARA Plugin Sample"
       category="Effect"
       developer="AAP Developers"
       unique-id="urn:org.androidaudioplugin/samples/aaparapluginsample/EffectSample"
-      library="libaap-ara-plugin-sample.so">
+      library="libaap-ara-plugin-sample.so"
+      gui:ui-view-factory="org.androidaudioplugin.aaparapluginsample.AraPluginViewFactory"
+      gui:ui-activity="org.androidaudioplugin.aaparapluginsample.MainActivity">
     <ports>
       <port direction="output" content="audio" name="Analysis Out L" />
       <port direction="output" content="audio" name="Analysis Out R" />

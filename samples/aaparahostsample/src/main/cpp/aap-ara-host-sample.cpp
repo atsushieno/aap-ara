@@ -12,9 +12,41 @@
 #include "aap/ext/ara.h"
 #include "aap/ara/host-runtime.h"
 #include "aap/ara/registry.h"
+#include "aap/core/aapxs/ara-aapxs.h"
 #include "aap/unstable/logging.h"
 
 #define LOG_TAG "AAP.ARA.HostSample"
+
+// Use AAP's JNI Binder bridge for an app-owned service endpoint. The exported
+// Android service remains exclusively owned by the external AAP host.
+extern "C" JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_createPrivateConnection(
+        JNIEnv* env, jobject, jint connectionId, jstring packageName, jstring serviceClass) {
+    aap::ara::addToRegistry(*aap::xs::AAPXSDefinitionRegistry::getStandardExtensions());
+    auto natives = env->FindClass("org/androidaudioplugin/AudioPluginNatives");
+    if (!natives) return nullptr;
+    auto create = env->GetStaticMethodID(natives, "createBinderForService", "()Landroid/os/IBinder;");
+    if (!create) return nullptr;
+    auto add = env->GetStaticMethodID(natives, "addBinderForClient", "(ILjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;)V");
+    if (!add) return nullptr;
+    auto binder = env->CallStaticObjectMethod(natives, create);
+    if (env->ExceptionCheck()) return nullptr;
+    env->CallStaticVoidMethod(natives, add, connectionId, packageName, serviceClass, binder);
+    return binder;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_closePrivateConnection(
+        JNIEnv* env, jobject, jint connectionId, jstring packageName, jstring serviceClass, jobject binder) {
+    auto natives = env->FindClass("org/androidaudioplugin/AudioPluginNatives");
+    if (!natives) return;
+    auto remove = env->GetStaticMethodID(natives, "removeBinderForClient", "(ILjava/lang/String;Ljava/lang/String;)V");
+    if (!remove) return;
+    auto destroy = env->GetStaticMethodID(natives, "destroyBinderForService", "(Landroid/os/IBinder;)V");
+    if (!destroy) return;
+    env->CallStaticVoidMethod(natives, remove, connectionId, packageName, serviceClass);
+    if (!env->ExceptionCheck()) env->CallStaticVoidMethod(natives, destroy, binder);
+}
 
 namespace aap {
 class PluginClientConnectionList;
@@ -262,7 +294,7 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
         host_context.runtime.registerAudioSource(audioSourceId, host_context.source_provider);
         aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
                      "Registered host audio source id=%d", audioSourceId);
-        aap::ara::ScopedRemotePluginInstanceARAHostContext host_bridge(host_context.runtime, *instance);
+        auto host_bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(host_context.runtime, *instance);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Installed scoped host ARA extension bridge");
 
         aap_ara_color_t contextColor{0.2f, 0.6f, 0.9f};
@@ -462,6 +494,7 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
         host_context.runtime.unregisterAudioSource(audioSourceId);
         aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
                      "Unregistered host audio source id=%d", audioSourceId);
+        host_bridge.reset();
         client->destroyInstance(instance);
         delete client;
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "runScenario completed successfully");
@@ -476,4 +509,240 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
         aap::a_log(AAP_LOG_LEVEL_ERROR, LOG_TAG, "Scenario failed with unknown native exception");
         return env->NewStringUTF("Scenario failed with an unknown native exception.");
     }
+}
+
+
+// An editor session is confined to the activity's single worker thread. The host
+// bridge outlives all model calls, including reverse sample-read callbacks.
+namespace {
+class ToneProvider : public aap::ara::AudioSourceContentProvider {
+    int rate;
+public:
+    float frequency = 220, gain = 0.2f;
+    explicit ToneProvider(int rate_) : rate(rate_) {}
+    int32_t channelCount() const override { return 2; }
+    double sampleRate() const override { return rate; }
+    aap_ara_sample_count_t sampleCount() const override { return rate * 60; }
+    uint32_t supportedSampleFormats() const override { return AAP_ARA_SAMPLE_FORMAT_FLOAT32; }
+    bool readSamples(const aap_ara_audio_source_sample_range_t& r,
+                     aap_ara_audio_source_samples_buffer_t& d) override {
+        if (r.sample_format != AAP_ARA_SAMPLE_FORMAT_FLOAT32 || r.start_sample < 0 ||
+            r.sample_count <= 0 || r.channel_count <= 0 || r.start_sample >= sampleCount()) return false;
+        auto frames = std::min(r.sample_count, sampleCount() - r.start_sample);
+        auto channels = std::min(r.channel_count, 2);
+        size_t bytes = size_t(frames) * channels * sizeof(float);
+        if (!d.data || d.data_size < bytes) return false;
+        auto* data = static_cast<float*>(d.data);
+        for (int c = 0; c < channels; ++c)
+            for (int i = 0; i < frames; ++i)
+                data[c * frames + i] = gain * std::sin(6.283185307179586 * frequency * (r.start_sample + i) / rate);
+        d.data_size = bytes; d.sample_count = frames; d.channel_count = channels;
+        d.sample_format = AAP_ARA_SAMPLE_FORMAT_FLOAT32;
+        return true;
+    }
+};
+struct EditorClip { int track; std::string name; double start, offset, duration; float frequency, gain;
+    std::shared_ptr<ToneProvider> provider; };
+struct EditorSession {
+    std::unique_ptr<aap::PluginClient> client;
+    aap::RemotePluginInstance* instance{};
+    aap::ara::HostRuntime runtime;
+    std::unique_ptr<aap::ara::ScopedRemotePluginInstanceARAHostContext> bridge;
+    // The registry's get_extension() proxy is replaced by subsequent lookups.
+    // Own our typed proxy so another instance cannot invalidate this session.
+    std::unique_ptr<aap::xs::AraClientAAPXS> ara_client;
+    aap_ara_extension_t* ara{};
+    AndroidAudioPlugin* plugin{};
+    int rate;
+    std::map<int, std::string> tracks;
+    std::map<int, EditorClip> clips;
+    bool document_created{};
+    explicit EditorSession(int rate_) : rate(rate_) {}
+    void removeClip(int id) {
+        ara->destroy_playback_region(ara, plugin, id);
+        ara->destroy_audio_modification(ara, plugin, id);
+        ara->enable_audio_source_samples_access(ara, plugin, id, false);
+        ara->destroy_audio_source(ara, plugin, id);
+        runtime.unregisterAudioSource(id);
+        clips.erase(id);
+    }
+    ~EditorSession() {
+        if (document_created) {
+            ara->begin_model_update(ara, plugin, 0);
+            while (!clips.empty()) removeClip(clips.begin()->first);
+            for (auto& t : tracks) ara->destroy_region_sequence(ara, plugin, t.first);
+            ara->destroy_musical_context(ara, plugin, 1);
+            ara->destroy_document(ara, plugin, 1);
+            ara->end_model_update(ara, plugin);
+        }
+        bridge.reset();
+        ara_client.reset();
+        if (instance) client->destroyInstance(instance);
+    }
+};
+std::unique_ptr<EditorSession> editor;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_editorInstanceId(JNIEnv*, jobject) {
+    return editor && editor->instance ? editor->instance->getInstanceId() : -1;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_openEditor(
+        JNIEnv* env, jobject, jint connection, jstring pluginId, jint rate) {
+    try {
+        editor.reset();
+        auto session = std::make_unique<EditorSession>(rate);
+        auto* connections = aap::AAPJniFacade::getInstance()->getPluginConnectionListFromJni(connection, true);
+        if (!connections) throw std::runtime_error("No service connection");
+        static auto list = aap::PluginListSnapshot::queryServices();
+        auto* registry = aap::xs::AAPXSDefinitionRegistry::getStandardExtensions();
+        aap::ara::addToRegistry(*registry);
+        session->client = std::make_unique<aap::PluginClient>(connections, &list, registry);
+        auto result = session->client->createInstance(jstringToStdString(env, pluginId), true);
+        if (!result.error.empty()) throw std::runtime_error(result.error);
+        session->instance = dynamic_cast<aap::RemotePluginInstance*>(session->client->getInstanceById(result.value));
+        if (!session->instance) throw std::runtime_error("No remote plugin instance");
+        session->plugin = session->instance->getPlugin();
+        session->ara = static_cast<aap_ara_extension_t*>(session->plugin->get_extension(session->plugin, AAP_ARA_EXTENSION_URI));
+        if (!session->ara) throw std::runtime_error("Plugin has no ARA extension");
+        auto* initiator = session->instance->getAAPXSDispatcher().getPluginAAPXSByUri(AAP_ARA_EXTENSION_URI);
+        session->ara_client = std::make_unique<aap::xs::AraClientAAPXS>(initiator, initiator->serialization);
+        session->ara = session->ara_client->asPluginExtension();
+        session->bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(session->runtime, *session->instance);
+        session->instance->prepare(8, rate);
+        session->ara->begin_model_update(session->ara, session->plugin, 0);
+        aap_ara_document_properties_t doc{sizeof(doc), "Untitled Project", "editor-document"};
+        aap_ara_musical_context_properties_t context{sizeof(context), "Song", nullptr, "editor-song"};
+        session->ara->create_document(session->ara, session->plugin, 1, &doc);
+        session->ara->create_musical_context(session->ara, session->plugin, 1, 1, &context);
+        session->ara->end_model_update(session->ara, session->plugin);
+        session->document_created = true;
+        editor = std::move(session);
+        return env->NewStringUTF("");
+    } catch (const std::exception& e) { return env->NewStringUTF(e.what()); }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_closeEditor(JNIEnv*, jobject) { editor.reset(); }
+
+// Rows are passed as Java objects rather than a custom wire format. All IDs are
+// stable across edits; unchanged sources retain their registered providers.
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
+        JNIEnv* env, jobject, jstring title, jintArray trackIds, jobjectArray trackNames,
+        jintArray clipIds, jintArray clipTracks, jobjectArray clipNames, jdoubleArray values) {
+    if (!editor) return env->NewStringUTF("Editor is not connected");
+    auto& s = *editor;
+    auto nt = env->GetArrayLength(trackIds), nc = env->GetArrayLength(clipIds);
+    if (env->GetArrayLength(trackNames) != nt || env->GetArrayLength(clipTracks) != nc ||
+        env->GetArrayLength(clipNames) != nc || env->GetArrayLength(values) != nc * 5)
+        return env->NewStringUTF("Invalid model arrays");
+    std::vector<jint> tids(nt), ids(nc), parents(nc);
+    std::vector<jdouble> v(nc * 5);
+    env->GetIntArrayRegion(trackIds, 0, nt, tids.data());
+    env->GetIntArrayRegion(clipIds, 0, nc, ids.data());
+    env->GetIntArrayRegion(clipTracks, 0, nc, parents.data());
+    env->GetDoubleArrayRegion(values, 0, nc * 5, v.data());
+    for (int i = 0; i < nc; ++i) {
+        if (std::find(tids.begin(), tids.end(), parents[i]) == tids.end() ||
+            !std::isfinite(v[i*5]) || !std::isfinite(v[i*5+1]) || !std::isfinite(v[i*5+2]) ||
+            !std::isfinite(v[i*5+3]) || !std::isfinite(v[i*5+4]) || v[i*5] < 0 || v[i*5+1] < 0 ||
+            v[i*5+2] <= 0 || v[i*5+1] + v[i*5+2] > 60 || v[i*5+3] < 20 ||
+            v[i*5+3] > 20000 || v[i*5+4] < 0 || v[i*5+4] > 1)
+            return env->NewStringUTF("Invalid clip properties");
+    }
+    auto nameAt = [&](jobjectArray array, int i) {
+        auto item = static_cast<jstring>(env->GetObjectArrayElement(array, i));
+        auto name = jstringToStdString(env, item); env->DeleteLocalRef(item); return name;
+    };
+    auto* a = s.ara; auto* p = s.plugin;
+    a->begin_model_update(a, p, 0);
+    auto name = jstringToStdString(env, title);
+    aap_ara_document_properties_t doc{sizeof(doc), name.c_str(), "editor-document"};
+    a->update_document_properties(a, p, 1, &doc);
+    for (auto it = s.clips.begin(); it != s.clips.end();) {
+        int id = (it++)->first;
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) s.removeClip(id);
+    }
+    // Create new sequences before moving clips; remove obsolete sequences last.
+    for (int i = 0; i < nt; ++i) {
+        auto n = nameAt(trackNames, i), persistent = "track-" + std::to_string(tids[i]);
+        aap_ara_region_sequence_properties_t props{sizeof(props), n.c_str(), i, 1, nullptr, persistent.c_str()};
+        if (s.tracks.count(tids[i])) a->update_region_sequence_properties(a, p, tids[i], &props);
+        else a->create_region_sequence(a, p, 1, tids[i], &props);
+        s.tracks[tids[i]] = n;
+    }
+    for (int i = 0; i < nc; ++i) {
+        int id = ids[i]; bool fresh = !s.clips.count(id);
+        auto n = nameAt(clipNames, i), persistent = "clip-" + std::to_string(id);
+        auto& c = s.clips[id];
+        bool changed = fresh || c.frequency != float(v[i*5+3]) || c.gain != float(v[i*5+4]);
+        c.track = parents[i]; c.name = n; c.start = v[i*5]; c.offset = v[i*5+1]; c.duration = v[i*5+2];
+        c.frequency = v[i*5+3]; c.gain = v[i*5+4];
+        if (fresh) {
+            c.provider = std::make_shared<ToneProvider>(s.rate);
+            s.runtime.registerAudioSource(id, c.provider);
+            aap_ara_audio_source_properties_t source{sizeof(source), n.c_str(), persistent.c_str(), s.rate * 60, double(s.rate), 2, false, "stereo"};
+            a->create_audio_source(a, p, 1, id, &source);
+            aap_ara_audio_modification_properties_t modification{sizeof(modification), n.c_str(), persistent.c_str()};
+            a->create_audio_modification(a, p, id, id, &modification);
+        }
+        c.provider->frequency = c.frequency; c.provider->gain = c.gain;
+        aap_ara_playback_region_properties_t region{sizeof(region), 0, c.offset, c.duration, c.start, c.duration, c.track, n.c_str(), nullptr};
+        if (fresh) a->create_playback_region(a, p, id, id, &region);
+        else {
+            a->update_playback_region_properties(a, p, id, &region);
+            aap_ara_audio_source_properties_t source{sizeof(source), n.c_str(), persistent.c_str(), s.rate * 60, double(s.rate), 2, false, "stereo"};
+            a->update_audio_source_properties(a, p, id, &source);
+            aap_ara_audio_modification_properties_t modification{sizeof(modification), n.c_str(), persistent.c_str()};
+            a->update_audio_modification_properties(a, p, id, &modification);
+        }
+        if (fresh) a->enable_audio_source_samples_access(a, p, id, true);
+        else if (changed) a->notify_audio_source_content_changed(a, p, id, 0, s.rate * 60);
+    }
+    for (auto it = s.tracks.begin(); it != s.tracks.end();) {
+        if (std::find(tids.begin(), tids.end(), it->first) == tids.end()) {
+            a->destroy_region_sequence(a, p, it->first); it = s.tracks.erase(it);
+        } else ++it;
+    }
+    a->end_model_update(a, p);
+    return env->NewStringUTF("");
+}
+
+// Test-only observation of the plugin's retained diagnostic output. In particular,
+// disabling a different source must not suppress this source's content reread.
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_verifyEditorAudio(
+        JNIEnv* env, jobject, jint clipId, jboolean postChange) {
+    if (!editor || !editor->clips.count(clipId)) return env->NewStringUTF("Missing editor clip");
+    auto& s = *editor;
+    std::array<float, 256> samples{};
+    aap_ara_audio_source_sample_range_t range{sizeof(range), 64, 128, 2, AAP_ARA_SAMPLE_FORMAT_FLOAT32};
+    aap_ara_audio_source_samples_buffer_t destination{sizeof(destination), samples.data(), sizeof(samples), 0, 0, 0};
+    s.clips.at(clipId).provider->readSamples(range, destination);
+    auto expected = [&](const float* data) { return std::array<float, 4>{data[0], data[1], compute_rms(data, 128), compute_peak(data, 128)}; };
+    auto left = expected(samples.data()), right = expected(samples.data() + 128);
+    bool matched = false;
+    s.instance->activate();
+    for (int attempt = 0; attempt < 50 && !matched; ++attempt) {
+        s.instance->process(8, 0);
+        auto* buffer = s.instance->getAudioPluginBuffer();
+        int output = 0; matched = true;
+        for (int i = 0; i < s.instance->getNumPorts(); ++i) {
+            auto* port = s.instance->getPort(i);
+            if (!port || port->getContentType() != AAP_CONTENT_TYPE_AUDIO || port->getPortDirection() != AAP_PORT_DIRECTION_OUTPUT) continue;
+            auto* data = static_cast<float*>(buffer->get_buffer(buffer, i));
+            if (!data || output >= 2) continue;
+            std::array<float, 4> actual{};
+            std::copy_n(data + (postChange ? 4 : 0), 4, actual.begin());
+            matched = matched && metrics_match(actual, output == 0 ? left : right);
+            ++output;
+        }
+        matched = matched && output == 2;
+        if (!matched) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    s.instance->deactivate();
+    return env->NewStringUTF(matched ? "" : "Editor source analysis did not match its content");
 }
