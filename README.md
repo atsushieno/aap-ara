@@ -35,5 +35,13 @@ The remaining example milestones are tracked in
 
 ## Local Development
 
-If `../aap-core` exists, Gradle uses it as an included build automatically.
-Otherwise, dependencies are resolved via Maven repositories.
+To use the current `../aap-core` checkout, enable the included build explicitly:
+
+```sh
+./gradlew -PuseLocalAapCoreBuild=true :samples:aaparahostsample:assembleDebug :samples:aaparapluginsample:assembleDebug
+```
+
+Otherwise, dependencies are resolved via Maven repositories (including Maven Local).
+
+The latest device verification is recorded in
+[`docs/DEVICE_VERIFICATION.md`](docs/DEVICE_VERIFICATION.md).

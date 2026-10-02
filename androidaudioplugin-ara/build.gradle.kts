@@ -1,6 +1,5 @@
 plugins {
     alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.dokka)
     alias(libs.plugins.vanniktech.maven.publish)
     signing
@@ -12,7 +11,7 @@ version = libs.versions.aap.ara.get()
 
 android {
     namespace = "org.androidaudioplugin.ara"
-    this.ext["description"] = "AndroidAudioPlugin - ARA extension package"
+    project.extra["description"] = "AndroidAudioPlugin - ARA extension package"
 
     defaultConfig {
         externalNativeBuild {
@@ -80,7 +79,7 @@ mavenPublishing {
     coordinates(group.toString(), project.name, version.toString())
     pom {
         name.set(project.name)
-        description.set(android.ext["description"].toString())
+        description.set(project.extra["description"].toString())
         url.set(packageUrl)
         scm { url.set(packageUrl) }
         licenses { license { name.set("MIT"); url.set(licenseUrl) } }

@@ -1,13 +1,13 @@
 [versions]
 
-aap-core = "0.11.0"
+aap-core = "0.12.0"
 aap-ara = "0.1.0-SNAPSHOT"
 
 android-compileSdk = "37"
 android-minSdk = "29"
 android-targetSdk = "37"
 
-agp = "8.13.2"
+agp = "9.4.1"
 kotlin = "2.3.21"
 ndk = "29.0.14206865"
 cmake = "3.31.5"
