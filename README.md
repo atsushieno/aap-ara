@@ -1,5 +1,7 @@
 # aap-ara
 
+![samples sshot](docs/images/samples.jpg)
+
 Experimental AAP-native ARA extension package for Audio Plugins For Android.
 
 This repository is intentionally separate from `aap-core` so that:
