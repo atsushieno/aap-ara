@@ -14,6 +14,18 @@ extern "C" {
 #define AAP_ARA_MAX_NAME_CHARS 256
 #define AAP_ARA_MAX_PERSISTENT_ID_CHARS 256
 #define AAP_ARA_MAX_CHANNEL_LAYOUT_TAG_CHARS 128
+#define AAP_ARA_MAX_ARCHIVE_BYTES 4096
+
+/* Optional, capability-negotiated additions to the experimental AAP binding. */
+enum { AAP_ARA_FEATURE_MODIFICATION_ARCHIVE = 1u << 0 };
+enum { AAP_ARA_HOST_SUPPORTS_CONTENT_UPDATES = 1u << 0 };
+enum {
+    AAP_ARA_CONTENT_AUDIO_SOURCE = 1,
+    AAP_ARA_CONTENT_AUDIO_MODIFICATION = 2,
+    AAP_ARA_CONTENT_PLAYBACK_REGION = 3,
+    AAP_ARA_CONTENT_DOCUMENT = 4
+};
+enum { AAP_ARA_CONTENT_SIGNAL_UNCHANGED = 1u << 0 };
 
 /*
  * AAP-native ARA extension entry point.
@@ -85,6 +97,7 @@ typedef struct aap_ara_factory_capability_t {
     uint32_t api_generations;
     uint32_t role_flags;
     uint32_t supported_playback_transformation_flags;
+    uint32_t supported_features;
 } aap_ara_factory_capability_t;
 
 typedef struct aap_ara_host_capability_t {
@@ -92,6 +105,7 @@ typedef struct aap_ara_host_capability_t {
     uint32_t api_generations;
     uint32_t role_flags;
     uint32_t supported_sample_formats;
+    uint32_t supported_model_updates;
 } aap_ara_host_capability_t;
 
 typedef struct aap_ara_document_properties_t {
@@ -166,6 +180,27 @@ typedef struct aap_ara_audio_source_samples_buffer_t {
     int32_t channel_count;
     uint32_t sample_format;
 } aap_ara_audio_source_samples_buffer_t;
+
+/* Plugin-owned opaque state for one modification, including all of its edits.
+ * data_size is the required/written size; the caller owns data and capacity.
+ * Empty state restores the default. This compact AAP archive API is not the
+ * full ARA archive-controller API. Maximum payload: AAP_ARA_MAX_ARCHIVE_BYTES. */
+typedef struct aap_ara_archive_buffer_t {
+    uint32_t struct_size;
+    void* data;
+    size_t capacity;
+    size_t data_size;
+} aap_ara_archive_buffer_t;
+
+typedef struct aap_ara_content_update_t {
+    uint32_t struct_size;
+    uint32_t kind;
+    int64_t object_id;
+    uint32_t flags;
+    bool has_time_range;
+    aap_ara_time_position_t start;
+    aap_ara_time_duration_t duration;
+} aap_ara_content_update_t;
 
 /*
  * The plug-in extension is driven by the host. The host uses it to construct
@@ -308,6 +343,15 @@ typedef struct aap_ara_extension_t {
             struct aap_ara_extension_t* ext,
             AndroidAudioPlugin* plugin,
             aap_ara_playback_region_id_t playback_region_id);
+
+    /* Only access these appended callbacks after negotiating
+     * AAP_ARA_FEATURE_MODIFICATION_ARCHIVE via get_factory_capability(). */
+    RT_UNSAFE bool (*store_audio_modification_state)(struct aap_ara_extension_t* ext,
+            AndroidAudioPlugin* plugin, aap_ara_audio_modification_id_t id,
+            aap_ara_archive_buffer_t* destination);
+    RT_UNSAFE bool (*restore_audio_modification_state)(struct aap_ara_extension_t* ext,
+            AndroidAudioPlugin* plugin, aap_ara_audio_modification_id_t id,
+            const void* data, size_t data_size);
 } aap_ara_extension_t;
 
 /*
@@ -335,6 +379,13 @@ typedef struct aap_ara_host_extension_t {
             aap_ara_audio_source_id_t audio_source_id,
             const aap_ara_audio_source_sample_range_t* sample_range,
             aap_ara_audio_source_samples_buffer_t* destination);
+
+    /* Check host capability size and AAP_ARA_HOST_SUPPORTS_CONTENT_UPDATES
+     * before accessing. Notify user/plugin-originated edits, never echo a host
+     * restoration. Related regions inherit modification changes. Host handlers
+     * must enqueue work and return, rather than reentering the plugin here. */
+    RT_UNSAFE void (*notify_content_changed)(struct aap_ara_host_extension_t* ext,
+            AndroidAudioPluginHost* host, const aap_ara_content_update_t* update);
 } aap_ara_host_extension_t;
 
 #ifdef __cplusplus

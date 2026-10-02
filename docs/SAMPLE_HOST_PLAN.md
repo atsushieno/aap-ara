@@ -30,7 +30,8 @@ helper surface. The first piece of that is `aap::ara::HostRuntime`, which owns:
 
 - host capability callbacks,
 - host-side audio-source registration,
-- host-side sample-read dispatch.
+- host-side sample-read dispatch,
+- plugin-originated content-update callbacks.
 
 Future ARA host helper classes can extend this area with document/archive and
 content-access helpers.
@@ -81,14 +82,19 @@ This demonstrates that the plug-in is not using stale cached data.
 
 ## What is currently implemented
 
-The current implementation is aimed at milestones 1 through 3:
+The current implementation covers milestones 1 through 3 and a small project editor:
 
 - `aap::ara::HostRuntime` provides host capability and sample-read callbacks,
 - the sample host registers a deterministic stereo source provider,
 - the sample plug-in reads host-provided samples and computes verification
   metrics,
 - the sample host compares expected and observed metrics before and after a
-  content change notification.
+  content change notification,
+- multiple tracks and clips retain stable ARA identities across model edits,
+- free clip dragging updates playback-region timing and sequence membership,
+- the host embeds the UI of the same plugin instance receiving its model,
+- plugin gain edits notify the host, which archives their state for project
+  save/load and undo/redo without notification loops.
 
 This is the minimum viable ARA-prefetch demonstration for AAP.
 
@@ -96,22 +102,23 @@ This is the minimum viable ARA-prefetch demonstration for AAP.
 
 ### Archive persistence
 
-Add sample archive save/restore coverage so a host can persist document-model
-state and prove it can reconstruct an ARA editing session.
+Compact per-modification opaque archives and project JSON persistence are
+implemented. Full ARA document archive-controller semantics remain future work.
 
 ### Musical content and timeline synchronization
 
-Add tempo, meter, content-update, or musical-context changes that cause a
-plug-in-visible model update, not just object creation.
+Arrangement and bidirectional content updates are implemented. Tempo, meter and
+musical content-reader APIs remain future work.
 
 ### Multiple audio sources and playback regions
 
-Extend the scenario beyond one deterministic source so the sample exercises
-host-side ownership and mapping of several related ARA objects.
+The editor already maps multiple sources, modifications and playback regions.
+Extend audible rendering and file import beyond the current generated tones and
+diagnostic output.
 
 ### Host UI/editor integration
 
-Demonstrate editor-facing host state that matters for practical ARA use, such
+The same-instance hosted Compose UI is implemented. Add editor-facing state such
 as focused playback region or selection changes, if and when the AAP ARA
 contract defines those hooks.
 

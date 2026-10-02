@@ -4,6 +4,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include "aap/core/host/plugin-instance.h"
 #include "aap/ext/ara.h"
 
@@ -33,6 +34,8 @@ class HostRuntime {
     uint32_t role_flags{AAP_ARA_ROLE_EDITOR_RENDERER};
     uint32_t supported_sample_formats{AAP_ARA_SAMPLE_FORMAT_FLOAT32};
     std::map<aap_ara_audio_source_id_t, SourceEntry> sources{};
+    mutable std::mutex updates_mutex;
+    std::function<void(const aap_ara_content_update_t&)> content_update_handler;
 
     static void staticGetHostCapability(
             aap_ara_host_extension_t* ext,
@@ -44,12 +47,15 @@ class HostRuntime {
             aap_ara_audio_source_id_t audioSourceId,
             const aap_ara_audio_source_sample_range_t* sampleRange,
             aap_ara_audio_source_samples_buffer_t* destination);
+    static void staticNotifyContentChanged(aap_ara_host_extension_t*, AndroidAudioPluginHost*, const aap_ara_content_update_t*);
 
 public:
     HostRuntime();
     ~HostRuntime() = default;
 
     void setCapabilities(uint32_t apiGenerations, uint32_t roleFlags, uint32_t supportedSampleFormats);
+    // The callback runs on a Binder thread and must enqueue, without reentering the plugin.
+    void setContentUpdateHandler(std::function<void(const aap_ara_content_update_t&)> handler);
 
     void registerAudioSource(
             aap_ara_audio_source_id_t audioSourceId,

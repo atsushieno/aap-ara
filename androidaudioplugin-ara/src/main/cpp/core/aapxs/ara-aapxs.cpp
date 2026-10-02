@@ -1,5 +1,7 @@
 #include "aap/core/aapxs/ara-aapxs.h"
 #include <cstring>
+#include <algorithm>
+#include <mutex>
 #include "aap/unstable/logging.h"
 
 #define LOG_TAG "AAP.ARA.AAPXS"
@@ -307,6 +309,31 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_process_incoming_plugin_aapxs_reque
             if (ext && ext->destroy_playback_region)
                 ext->destroy_playback_region(ext, plugin, asWire<aap_ara_object_id_wire_t>(serialization)->object_id);
             break;
+        case OPCODE_ARA_STORE_MODIFICATION_STATE:
+        case OPCODE_ARA_RESTORE_MODIFICATION_STATE: {
+            // Binder carries the fixed shared-memory record, but not the
+            // sender's serialization.data_size. Validate capacity and the
+            // archive's embedded byte count instead.
+            if (!serialization->data || serialization->data_capacity < sizeof(aap_ara_archive_wire_t)) break;
+            auto* wire = asWire<aap_ara_archive_wire_t>(serialization);
+            wire->succeeded = false;
+            aap_ara_factory_capability_t capability{};
+            capability.struct_size = sizeof(capability);
+            if (ext && ext->get_factory_capability) ext->get_factory_capability(ext, plugin, &capability);
+            if (capability.struct_size >= sizeof(capability) &&
+                (capability.supported_features & AAP_ARA_FEATURE_MODIFICATION_ARCHIVE)) {
+                if (request->opcode == OPCODE_ARA_STORE_MODIFICATION_STATE && ext->store_audio_modification_state) {
+                    aap_ara_archive_buffer_t destination{sizeof(destination), wire->data, sizeof(wire->data), 0};
+                    wire->succeeded = ext->store_audio_modification_state(ext, plugin, wire->modification_id, &destination)
+                        && destination.data_size <= sizeof(wire->data);
+                    wire->data_size = wire->succeeded ? destination.data_size : 0;
+                } else if (wire->data_size <= sizeof(wire->data) && ext->restore_audio_modification_state)
+                    wire->succeeded = ext->restore_audio_modification_state(ext, plugin, wire->modification_id, wire->data, wire->data_size);
+            }
+            serialization->data_size = sizeof(*wire);
+            aapxsInstance->send_aapxs_reply(aapxsInstance, request);
+            return;
+        }
         default:
             break;
     }
@@ -358,6 +385,16 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_process_incoming_host_aapxs_request
             aapxsInstance->send_aapxs_reply(aapxsInstance, request);
             return;
         }
+        case OPCODE_ARA_NOTIFY_CONTENT_CHANGED: {
+            aap_ara_host_capability_t capability{};
+            capability.struct_size = sizeof(capability);
+            if (ext && ext->get_host_capability) ext->get_host_capability(ext, host, &capability);
+            if (serialization->data && serialization->data_capacity >= sizeof(aap_ara_content_update_t) &&
+                capability.struct_size >= sizeof(capability) &&
+                (capability.supported_model_updates & AAP_ARA_HOST_SUPPORTS_CONTENT_UPDATES) && ext->notify_content_changed)
+                ext->notify_content_changed(ext, host, asWire<aap_ara_content_update_t>(serialization));
+            break;
+        }
         default:
             break;
     }
@@ -382,19 +419,25 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_process_incoming_host_aapxs_reply(
 AAPXSExtensionClientProxy aap::xs::AAPXSDefinition_Ara::aapxs_ara_get_plugin_proxy(
         struct AAPXSDefinition* feature, AAPXSInitiatorInstance* aapxsInstance,
         AAPXSSerializationContext* serialization) {
-    auto client = (AAPXSDefinition_Ara*) feature->aapxs_context;
-    client->typed_client = std::make_unique<AraClientAAPXS>(aapxsInstance, serialization);
-    client->client_proxy = AAPXSExtensionClientProxy{client->typed_client.get(), aapxs_ara_as_plugin_extension};
-    return client->client_proxy;
+    static std::mutex creation_mutex;
+    const std::lock_guard<std::mutex> lock(creation_mutex);
+    if (!aapxsInstance->aapxs_context)
+        aapxsInstance->aapxs_context = new AraClientAAPXS(aapxsInstance, serialization);
+    return AAPXSExtensionClientProxy{aapxsInstance->aapxs_context, aapxs_ara_as_plugin_extension};
 }
 
 AAPXSExtensionServiceProxy aap::xs::AAPXSDefinition_Ara::aapxs_ara_get_host_proxy(
         struct AAPXSDefinition* feature, AAPXSInitiatorInstance* aapxsInstance,
         AAPXSSerializationContext* serialization) {
-    auto service = (AAPXSDefinition_Ara*) feature->aapxs_context;
-    service->typed_service = std::make_unique<AraServiceAAPXS>(aapxsInstance, serialization);
-    service->service_proxy = AAPXSExtensionServiceProxy{service->typed_service.get(), aapxs_ara_as_host_extension};
-    return service->service_proxy;
+    static std::mutex creation_mutex;
+    const std::lock_guard<std::mutex> lock(creation_mutex);
+    if (!aapxsInstance->aapxs_context)
+        aapxsInstance->aapxs_context = new AraServiceAAPXS(aapxsInstance, serialization);
+    return AAPXSExtensionServiceProxy{aapxsInstance->aapxs_context, aapxs_ara_as_host_extension};
+}
+
+void aap::xs::AAPXSDefinition_Ara::aapxs_ara_release_instance_context(AAPXSDefinition*, void* context) {
+    delete static_cast<TypedAAPXS*>(context);
 }
 
 void aap::xs::AraClientAAPXS::invokeVoidEdit(int32_t opcode, const void* payload, size_t payloadSize) {
@@ -406,10 +449,13 @@ void aap::xs::AraClientAAPXS::invokeVoidEdit(int32_t opcode, const void* payload
 
 void aap::xs::AraClientAAPXS::getFactoryCapability(aap_ara_factory_capability_t& destination) {
     auto result = callAndWait<aap_ara_factory_capability_t>(OPCODE_ARA_GET_FACTORY_CAPABILITY, nullptr, 0,
-            [](AAPXSSerializationContext* ctx) { return *asWire<aap_ara_factory_capability_t>(ctx); },
-            sizeof(aap_ara_factory_capability_t));
+            [](AAPXSSerializationContext* ctx) {
+                aap_ara_factory_capability_t value{};
+                memcpy(&value, ctx->data, std::min(ctx->data_size, sizeof(value)));
+                return value;
+            }, sizeof(aap_ara_factory_capability_t));
     if (result.isOk())
-        destination = result.value;
+        memcpy(&destination, &result.value, std::min<size_t>(destination.struct_size, sizeof(destination)));
     else
         aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA getFactoryCapability failed: %s", result.error.c_str());
 }
@@ -572,10 +618,13 @@ void aap::xs::AraClientAAPXS::destroyPlaybackRegion(aap_ara_playback_region_id_t
 void aap::xs::AraServiceAAPXS::getHostCapability(aap_ara_host_capability_t& destination) {
     // Blocking-sync on the async core: gains a request timeout and a host-reported error channel.
     auto result = callAndWait<aap_ara_host_capability_t>(OPCODE_ARA_GET_HOST_CAPABILITY, nullptr, 0,
-            [](AAPXSSerializationContext* ctx) { return *asWire<aap_ara_host_capability_t>(ctx); },
-            sizeof(aap_ara_host_capability_t));
+            [](AAPXSSerializationContext* ctx) {
+                aap_ara_host_capability_t value{};
+                memcpy(&value, ctx->data, std::min(ctx->data_size, sizeof(value)));
+                return value;
+            }, sizeof(aap_ara_host_capability_t));
     if (result.isOk())
-        destination = result.value;
+        memcpy(&destination, &result.value, std::min<size_t>(destination.struct_size, sizeof(destination)));
     else
         aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA getHostCapability failed: %s", result.error.c_str());
 }
@@ -602,4 +651,33 @@ void aap::xs::AraServiceAAPXS::readAudioSourceSamples(aap_ara_audio_source_id_t 
         destination->channel_count = wire.result_channel_count;
         destination->sample_format = wire.result_sample_format;
     }
+}
+
+bool aap::xs::AraClientAAPXS::storeModificationState(int64_t id, aap_ara_archive_buffer_t& destination) {
+    aap_ara_archive_wire_t wire{};
+    wire.modification_id = id;
+    auto result = callAndWait<aap_ara_archive_wire_t>(OPCODE_ARA_STORE_MODIFICATION_STATE, &wire, sizeof(wire),
+            [](AAPXSSerializationContext* ctx) { return *asWire<aap_ara_archive_wire_t>(ctx); }, sizeof(wire));
+    destination.data_size = 0;
+    if (!result.isOk() || !result.value.succeeded || result.value.data_size > AAP_ARA_MAX_ARCHIVE_BYTES) return false;
+    destination.data_size = result.value.data_size;
+    if (destination.data_size > destination.capacity || (!destination.data && destination.data_size)) return false;
+    memcpy(destination.data, result.value.data, destination.data_size);
+    return true;
+}
+
+bool aap::xs::AraClientAAPXS::restoreModificationState(int64_t id, const void* data, size_t size) {
+    if (size > AAP_ARA_MAX_ARCHIVE_BYTES || (!data && size)) return false;
+    aap_ara_archive_wire_t wire{};
+    wire.modification_id = id; wire.data_size = size;
+    if (size) memcpy(wire.data, data, size);
+    auto result = callAndWait<aap_ara_archive_wire_t>(OPCODE_ARA_RESTORE_MODIFICATION_STATE, &wire, sizeof(wire),
+            [](AAPXSSerializationContext* ctx) { return *asWire<aap_ara_archive_wire_t>(ctx); }, sizeof(wire));
+    return result.isOk() && result.value.succeeded;
+}
+
+void aap::xs::AraServiceAAPXS::notifyContentChanged(const aap_ara_content_update_t& update) {
+    auto result = callAndWait<bool>(OPCODE_ARA_NOTIFY_CONTENT_CHANGED, &update, sizeof(update),
+            [](AAPXSSerializationContext*) { return true; }, 0);
+    if (!result.isOk()) aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA content update failed: %s", result.error.c_str());
 }

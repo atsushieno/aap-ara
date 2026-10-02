@@ -20,6 +20,19 @@ HostRuntime::HostRuntime() {
     host_extension.aapxs_context = this;
     host_extension.get_host_capability = staticGetHostCapability;
     host_extension.read_audio_source_samples = staticReadAudioSourceSamples;
+    host_extension.notify_content_changed = staticNotifyContentChanged;
+}
+
+void HostRuntime::setContentUpdateHandler(std::function<void(const aap_ara_content_update_t&)> handler) {
+    const std::lock_guard<std::mutex> lock(updates_mutex);
+    content_update_handler = std::move(handler);
+}
+
+void HostRuntime::staticNotifyContentChanged(aap_ara_host_extension_t* ext, AndroidAudioPluginHost*, const aap_ara_content_update_t* update) {
+    if (!ext || !update || update->struct_size < sizeof(*update)) return;
+    auto* runtime = static_cast<HostRuntime*>(ext->aapxs_context);
+    const std::lock_guard<std::mutex> lock(runtime->updates_mutex);
+    if (runtime->content_update_handler) runtime->content_update_handler(*update);
 }
 
 void HostRuntime::setCapabilities(uint32_t apiGenerations, uint32_t roleFlags, uint32_t supportedSampleFormats) {
@@ -39,13 +52,19 @@ void HostRuntime::unregisterAudioSource(aap_ara_audio_source_id_t audioSourceId)
 }
 
 void HostRuntime::getHostCapability(aap_ara_host_capability_t& destination) const {
+    auto capacity = destination.struct_size;
     destination.struct_size = sizeof(aap_ara_host_capability_t);
     destination.api_generations = api_generations;
     destination.role_flags = role_flags;
     destination.supported_sample_formats = supported_sample_formats;
+    if (capacity >= sizeof(destination)) {
+        const std::lock_guard<std::mutex> lock(updates_mutex);
+        destination.supported_model_updates = content_update_handler ? AAP_ARA_HOST_SUPPORTS_CONTENT_UPDATES : 0;
+    }
     aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                 "getHostCapability api=%u roles=%u formats=%u",
-                 destination.api_generations, destination.role_flags, destination.supported_sample_formats);
+                 "getHostCapability api=%u roles=%u formats=%u updates=%u capacity=%u",
+                 destination.api_generations, destination.role_flags, destination.supported_sample_formats,
+                 capacity >= sizeof(destination) ? destination.supported_model_updates : 0, capacity);
 }
 
 bool HostRuntime::readAudioSourceSamples(

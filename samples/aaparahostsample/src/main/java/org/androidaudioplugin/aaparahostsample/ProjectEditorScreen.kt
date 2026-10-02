@@ -62,7 +62,9 @@ fun ProjectEditorScreen(
                 EditorButton("Edit clip", !busy && clip != null) { clipEdit = clip?.copy() }
                 EditorButton("Duplicate", !busy && clip != null) {
                     clip?.let { c -> val id = document.nextId
-                        onChange { clips.add(c.copy(id = nextId++, start = c.start + c.duration, name = "${c.name} copy")) }
+                        onChange { clips.find { it.id == c.id }?.let { source ->
+                            clips.add(source.copy(id = nextId++, start = source.start + source.duration, name = "${source.name} copy"))
+                        } }
                         selectedClipId = id
                     }
                 }
@@ -77,9 +79,15 @@ fun ProjectEditorScreen(
                 onShowPluginUi?.let { EditorButton("Show plugin UI", !busy && connected, it) }
             }
             Text("Generated stereo tones · source length 60s · diagnostic audio output", style = MaterialTheme.typography.labelSmall)
+            Text("Drag clips to move them in time or between tracks · Plugin edits: ${document.clips.count { it.pluginState.isNotEmpty() }} clips",
+                style = MaterialTheme.typography.labelSmall)
             ProjectTimeline(document, selectedTrackId = track?.id, selectedClipId = selectedClipId,
                 modifier = Modifier.weight(1f).fillMaxWidth(), onTrack = { selectedTrackId = it },
-                onClip = { selectedClipId = it.id; selectedTrackId = it.track })
+                onClip = { selectedClipId = it.id; selectedTrackId = it.track },
+                onMove = if (busy) null else { id, target, position ->
+                    onChange { clips.find { it.id == id }?.let { it.track = target; it.start = position } }
+                    selectedTrackId = target
+                })
             if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(8.dp)) {
                 Text(status, Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 140.dp)
@@ -114,7 +122,7 @@ fun ProjectEditorScreen(
             onChange {
                 val fresh = clips.none { it.id == edited.id }
                 val index = clips.indexOfFirst { it.id == edited.id }
-                if (index >= 0) clips[index] = edited else clips.add(edited)
+                if (index >= 0) clips[index] = edited.copy(pluginState = clips[index].pluginState) else clips.add(edited)
                 if (fresh) nextId++
             }
             selectedClipId = edited.id; selectedTrackId = edited.track; clipEdit = null

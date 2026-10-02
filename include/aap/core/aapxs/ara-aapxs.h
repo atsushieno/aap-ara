@@ -28,10 +28,20 @@ const int32_t OPCODE_ARA_DESTROY_AUDIO_MODIFICATION = 20;
 const int32_t OPCODE_ARA_CREATE_PLAYBACK_REGION = 21;
 const int32_t OPCODE_ARA_UPDATE_PLAYBACK_REGION_PROPERTIES = 22;
 const int32_t OPCODE_ARA_DESTROY_PLAYBACK_REGION = 23;
+const int32_t OPCODE_ARA_STORE_MODIFICATION_STATE = 24;
+const int32_t OPCODE_ARA_RESTORE_MODIFICATION_STATE = 25;
 
 // host extension opcodes
 const int32_t OPCODE_ARA_GET_HOST_CAPABILITY = -1;
 const int32_t OPCODE_ARA_READ_AUDIO_SOURCE_SAMPLES = -2;
+const int32_t OPCODE_ARA_NOTIFY_CONTENT_CHANGED = -3;
+
+struct aap_ara_archive_wire_t {
+    int64_t modification_id;
+    uint32_t data_size;
+    bool succeeded;
+    uint8_t data[AAP_ARA_MAX_ARCHIVE_BYTES];
+};
 
 /*
  * Shared memory backing for both control payloads and chunked sample reads.
@@ -224,6 +234,12 @@ namespace aap::xs {
         static void staticDestroyPlaybackRegion(aap_ara_extension_t* ext, AndroidAudioPlugin* plugin, aap_ara_playback_region_id_t playbackRegionId) {
             ((AraClientAAPXS*) ext->aapxs_context)->destroyPlaybackRegion(playbackRegionId);
         }
+        static bool staticStoreModificationState(aap_ara_extension_t* ext, AndroidAudioPlugin*, int64_t id, aap_ara_archive_buffer_t* destination) {
+            return destination && ((AraClientAAPXS*) ext->aapxs_context)->storeModificationState(id, *destination);
+        }
+        static bool staticRestoreModificationState(aap_ara_extension_t* ext, AndroidAudioPlugin*, int64_t id, const void* data, size_t size) {
+            return ((AraClientAAPXS*) ext->aapxs_context)->restoreModificationState(id, data, size);
+        }
 
         aap_ara_extension_t as_plugin_extension {
                 this,
@@ -249,7 +265,9 @@ namespace aap::xs {
                 staticDestroyAudioModification,
                 staticCreatePlaybackRegion,
                 staticUpdatePlaybackRegionProperties,
-                staticDestroyPlaybackRegion
+                staticDestroyPlaybackRegion,
+                staticStoreModificationState,
+                staticRestoreModificationState
         };
 
         // Synchronously invokes a void model-edit command and logs any failure/timeout. The
@@ -284,6 +302,8 @@ namespace aap::xs {
         void createPlaybackRegion(aap_ara_audio_modification_id_t audioModificationId, aap_ara_playback_region_id_t playbackRegionId, const aap_ara_playback_region_properties_t* properties);
         void updatePlaybackRegionProperties(aap_ara_playback_region_id_t playbackRegionId, const aap_ara_playback_region_properties_t* properties);
         void destroyPlaybackRegion(aap_ara_playback_region_id_t playbackRegionId);
+        bool storeModificationState(int64_t id, aap_ara_archive_buffer_t& destination);
+        bool restoreModificationState(int64_t id, const void* data, size_t size);
 
         aap_ara_extension_t* asPluginExtension() { return &as_plugin_extension; }
     };
@@ -295,7 +315,10 @@ namespace aap::xs {
         static void staticReadAudioSourceSamples(aap_ara_host_extension_t* ext, AndroidAudioPluginHost* host, aap_ara_audio_source_id_t audioSourceId, const aap_ara_audio_source_sample_range_t* sampleRange, aap_ara_audio_source_samples_buffer_t* destination) {
             ((AraServiceAAPXS*) ext->aapxs_context)->readAudioSourceSamples(audioSourceId, sampleRange, destination);
         }
-        aap_ara_host_extension_t as_host_extension{this, staticGetHostCapability, staticReadAudioSourceSamples};
+        static void staticNotifyContentChanged(aap_ara_host_extension_t* ext, AndroidAudioPluginHost*, const aap_ara_content_update_t* update) {
+            if (update) ((AraServiceAAPXS*) ext->aapxs_context)->notifyContentChanged(*update);
+        }
+        aap_ara_host_extension_t as_host_extension{this, staticGetHostCapability, staticReadAudioSourceSamples, staticNotifyContentChanged};
         // The samples of the last readAudioSourceSamples(); valid until the next call.
         std::vector<uint8_t> read_samples{};
 
@@ -305,6 +328,7 @@ namespace aap::xs {
 
         void getHostCapability(aap_ara_host_capability_t& destination);
         void readAudioSourceSamples(aap_ara_audio_source_id_t audioSourceId, const aap_ara_audio_source_sample_range_t* sampleRange, aap_ara_audio_source_samples_buffer_t* destination);
+        void notifyContentChanged(const aap_ara_content_update_t& update);
 
         aap_ara_host_extension_t* asHostExtension() { return &as_host_extension; }
     };
@@ -338,6 +362,7 @@ namespace aap::xs {
                 struct AAPXSDefinition* feature,
                 AAPXSInitiatorInstance* aapxsInstance,
                 AAPXSSerializationContext* serialization);
+        static void aapxs_ara_release_instance_context(AAPXSDefinition*, void* context);
         static void* aapxs_ara_as_plugin_extension(AAPXSExtensionClientProxy* proxy) {
             return ((AraClientAAPXS*) proxy->aapxs_context)->asPluginExtension();
         }
@@ -358,7 +383,7 @@ namespace aap::xs {
                                   // edits/reads are not real-time and (e.g. readAudioSourceSamples)
                                   // can transfer large payloads, so they must never take the SysEx8
                                   // realtime path. They are invoked asynchronously over Binder.
-                                  nullptr};
+                                  nullptr, nullptr, aapxs_ara_release_instance_context};
 
     public:
         AAPXSDefinition& asPublic() override { return aapxs_ara; }

@@ -12,6 +12,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import org.androidaudioplugin.hosting.AudioPluginClientBase
 import org.androidaudioplugin.hosting.AudioPluginHostHelper
@@ -57,6 +58,18 @@ class ProjectEditorController private constructor(private val context: Context, 
 
     @Composable
     fun Editor() {
+        LaunchedEffect(this) {
+            while (true) {
+                delay(150)
+                if (connected && !busy && !disposed) {
+                    // Only one worker operation may touch the native session.
+                    worker.execute {
+                        val updates = AraHostSampleNative.drainPluginUpdates()
+                        mainHandler.post { if (!disposed) acceptPluginUpdates(updates) }
+                    }
+                }
+            }
+        }
         MaterialTheme(colorScheme = darkColorScheme()) {
             val revision = historyRevision
             var showPluginUi by remember { mutableStateOf(false) }
@@ -100,8 +113,31 @@ class ProjectEditorController private constructor(private val context: Context, 
         }
     }
 
-    private fun mutate(change: ProjectDocument.() -> Unit) {
+    private fun acceptPluginUpdates(updates: Array<String>) {
+        if (updates.isEmpty()) return
+        val next = ProjectDocument.decode(document.encode())
+        if (!next.applyPluginUpdates(updates)) return
+        undo.addLast(document.encode()); redo.clear(); historyRevision++
+        document = next
+        status = "Plugin content synchronized • undo and save include plugin edits"
+    }
+    // Drain before user actions, so an edit followed immediately by Save/Undo
+    // cannot miss a reverse notification that has already reached the host.
+    private fun afterPluginUpdates(action: () -> Unit) {
         if (busy) return
+        if (!connected) { action(); return }
+        busy = true
+        worker.execute {
+            val updates = AraHostSampleNative.drainPluginUpdates()
+            mainHandler.post {
+                if (disposed) return@post
+                acceptPluginUpdates(updates)
+                busy = false
+                action()
+            }
+        }
+    }
+    private fun mutate(change: ProjectDocument.() -> Unit) = afterPluginUpdates {
         val next = ProjectDocument.decode(document.encode())
         next.change()
         replaceDocument(next)
@@ -110,16 +146,16 @@ class ProjectEditorController private constructor(private val context: Context, 
         undo.addLast(document.encode()); redo.clear(); historyRevision++
         document = next; sync()
     }
-    private fun history(from: java.util.ArrayDeque<String>, to: java.util.ArrayDeque<String>) {
-        if (busy || from.isEmpty()) return
+    private fun history(from: java.util.ArrayDeque<String>, to: java.util.ArrayDeque<String>) = afterPluginUpdates {
+        if (from.isEmpty()) return@afterPluginUpdates
         to.addLast(document.encode()); document = ProjectDocument.decode(from.removeLast())
         historyRevision++; sync()
     }
-    private fun save() {
+    private fun save() = afterPluginUpdates {
         if (!busy) runCatching { savedProject.writeText(document.encode()) }
             .onSuccess { status = "Project saved" }.onFailure { status = "Save failed: ${it.message}" }
     }
-    private fun load() {
+    private fun load() = afterPluginUpdates {
         if (!busy) runCatching { ProjectDocument.decode(savedProject.readText()) }
             .onSuccess { replaceDocument(it) }.onFailure { status = "Load failed: ${it.message}" }
     }

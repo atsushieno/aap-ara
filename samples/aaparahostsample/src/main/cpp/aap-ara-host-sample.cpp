@@ -5,6 +5,7 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <set>
 #include <vector>
 
 #include "aap/core/host/plugin-host.h"
@@ -541,15 +542,14 @@ public:
         return true;
     }
 };
-struct EditorClip { int track; std::string name; double start, offset, duration; float frequency, gain;
+struct EditorClip { int track; std::string name, plugin_state; double start, offset, duration; float frequency, gain;
     std::shared_ptr<ToneProvider> provider; };
 struct EditorSession {
     std::unique_ptr<aap::PluginClient> client;
     aap::RemotePluginInstance* instance{};
     aap::ara::HostRuntime runtime;
     std::unique_ptr<aap::ara::ScopedRemotePluginInstanceARAHostContext> bridge;
-    // The registry's get_extension() proxy is replaced by subsequent lookups.
-    // Own our typed proxy so another instance cannot invalidate this session.
+    // Worker-owned facade for the editor's serialized model calls.
     std::unique_ptr<aap::xs::AraClientAAPXS> ara_client;
     aap_ara_extension_t* ara{};
     AndroidAudioPlugin* plugin{};
@@ -557,7 +557,15 @@ struct EditorSession {
     std::map<int, std::string> tracks;
     std::map<int, EditorClip> clips;
     bool document_created{};
-    explicit EditorSession(int rate_) : rate(rate_) {}
+    bool supports_archive = false;
+    std::mutex updates_mutex;
+    std::vector<aap_ara_content_update_t> pending_updates;
+    explicit EditorSession(int rate_) : rate(rate_) {
+        runtime.setContentUpdateHandler([this](const aap_ara_content_update_t& update) {
+            const std::lock_guard<std::mutex> lock(updates_mutex);
+            pending_updates.push_back(update);
+        });
+    }
     void removeClip(int id) {
         ara->destroy_playback_region(ara, plugin, id);
         ara->destroy_audio_modification(ara, plugin, id);
@@ -567,6 +575,7 @@ struct EditorSession {
         clips.erase(id);
     }
     ~EditorSession() {
+        runtime.setContentUpdateHandler({});
         if (document_created) {
             ara->begin_model_update(ara, plugin, 0);
             while (!clips.empty()) removeClip(clips.begin()->first);
@@ -581,6 +590,23 @@ struct EditorSession {
     }
 };
 std::unique_ptr<EditorSession> editor;
+std::string archive_hex(const void* data, size_t size) {
+    const char* digits = "0123456789abcdef";
+    std::string text;
+    auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) { text += digits[bytes[i] >> 4]; text += digits[bytes[i] & 15]; }
+    return text;
+}
+bool archive_bytes(const std::string& text, std::vector<uint8_t>& data) {
+    if (text.size() % 2 || text.size() > AAP_ARA_MAX_ARCHIVE_BYTES * 2) return false;
+    auto digit = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    for (size_t i = 0; i < text.size(); i += 2) {
+        int a = digit(text[i]), b = digit(text[i + 1]);
+        if (a < 0 || b < 0) return false;
+        data.push_back((a << 4) | b);
+    }
+    return true;
+}
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -610,6 +636,11 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_openEditor(
         auto* initiator = session->instance->getAAPXSDispatcher().getPluginAAPXSByUri(AAP_ARA_EXTENSION_URI);
         session->ara_client = std::make_unique<aap::xs::AraClientAAPXS>(initiator, initiator->serialization);
         session->ara = session->ara_client->asPluginExtension();
+        aap_ara_factory_capability_t capability{};
+        capability.struct_size = sizeof(capability);
+        session->ara->get_factory_capability(session->ara, session->plugin, &capability);
+        session->supports_archive = capability.struct_size >= sizeof(capability) &&
+            (capability.supported_features & AAP_ARA_FEATURE_MODIFICATION_ARCHIVE);
         session->bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(session->runtime, *session->instance);
         session->instance->prepare(8, rate);
         session->ara->begin_model_update(session->ara, session->plugin, 0);
@@ -627,17 +658,60 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_openEditor(
 extern "C" JNIEXPORT void JNICALL
 Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_closeEditor(JNIEnv*, jobject) { editor.reset(); }
 
+// Drain on the editor worker, after the reverse Binder callback has returned.
+// Alternating identity/hex archive strings keep arbitrary plugin state opaque.
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_drainPluginUpdates(JNIEnv* env, jobject) {
+    std::vector<std::string> result;
+    if (editor && editor->supports_archive) {
+        auto& s = *editor;
+        std::vector<aap_ara_content_update_t> updates;
+        {
+            const std::lock_guard<std::mutex> lock(s.updates_mutex);
+            updates.swap(s.pending_updates);
+        }
+        std::set<int> ids;
+        for (const auto& update : updates) {
+            if (update.kind == AAP_ARA_CONTENT_DOCUMENT) for (const auto& clip : s.clips) ids.insert(clip.first);
+            else if (update.kind >= AAP_ARA_CONTENT_AUDIO_SOURCE && update.kind <= AAP_ARA_CONTENT_PLAYBACK_REGION &&
+                     s.clips.count(update.object_id)) ids.insert(update.object_id);
+        }
+        for (int id : ids) {
+            std::array<uint8_t, AAP_ARA_MAX_ARCHIVE_BYTES> bytes{};
+            aap_ara_archive_buffer_t archive{sizeof(archive), bytes.data(), bytes.size(), 0};
+            if (!s.ara->store_audio_modification_state(s.ara, s.plugin, id, &archive)) {
+                // A failed fetch must not lose the dirty notification.
+                const std::lock_guard<std::mutex> lock(s.updates_mutex);
+                s.pending_updates.push_back({sizeof(aap_ara_content_update_t), AAP_ARA_CONTENT_AUDIO_MODIFICATION, id, 0, false, 0, 0});
+                continue;
+            }
+            auto state = archive_hex(bytes.data(), archive.data_size);
+            if (s.clips.at(id).plugin_state == state) continue;
+            s.clips.at(id).plugin_state = state;
+            result.push_back(std::to_string(id)); result.push_back(state);
+        }
+    }
+    auto strings = env->FindClass("java/lang/String");
+    auto array = env->NewObjectArray(result.size(), strings, nullptr);
+    for (size_t i = 0; i < result.size(); ++i) {
+        auto value = env->NewStringUTF(result[i].c_str());
+        env->SetObjectArrayElement(array, i, value); env->DeleteLocalRef(value);
+    }
+    env->DeleteLocalRef(strings);
+    return array;
+}
+
 // Rows are passed as Java objects rather than a custom wire format. All IDs are
 // stable across edits; unchanged sources retain their registered providers.
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
         JNIEnv* env, jobject, jstring title, jintArray trackIds, jobjectArray trackNames,
-        jintArray clipIds, jintArray clipTracks, jobjectArray clipNames, jdoubleArray values) {
+        jintArray clipIds, jintArray clipTracks, jobjectArray clipNames, jdoubleArray values, jobjectArray pluginStates) {
     if (!editor) return env->NewStringUTF("Editor is not connected");
     auto& s = *editor;
     auto nt = env->GetArrayLength(trackIds), nc = env->GetArrayLength(clipIds);
     if (env->GetArrayLength(trackNames) != nt || env->GetArrayLength(clipTracks) != nc ||
-        env->GetArrayLength(clipNames) != nc || env->GetArrayLength(values) != nc * 5)
+        env->GetArrayLength(clipNames) != nc || env->GetArrayLength(values) != nc * 5 || env->GetArrayLength(pluginStates) != nc)
         return env->NewStringUTF("Invalid model arrays");
     std::vector<jint> tids(nt), ids(nc), parents(nc);
     std::vector<jdouble> v(nc * 5);
@@ -658,6 +732,13 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
         auto name = jstringToStdString(env, item); env->DeleteLocalRef(item); return name;
     };
     auto* a = s.ara; auto* p = s.plugin;
+    std::vector<std::string> states;
+    std::vector<std::vector<uint8_t>> archives(nc);
+    for (int i = 0; i < nc; ++i) {
+        states.push_back(nameAt(pluginStates, i));
+        if (!archive_bytes(states.back(), archives[i])) return env->NewStringUTF("Invalid plugin state archive");
+        if (!s.supports_archive && !states.back().empty()) return env->NewStringUTF("Plugin does not support modification archives");
+    }
     a->begin_model_update(a, p, 0);
     auto name = jstringToStdString(env, title);
     aap_ara_document_properties_t doc{sizeof(doc), name.c_str(), "editor-document"};
@@ -701,6 +782,13 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
         }
         if (fresh) a->enable_audio_source_samples_access(a, p, id, true);
         else if (changed) a->notify_audio_source_content_changed(a, p, id, 0, s.rate * 60);
+        if (s.supports_archive && c.plugin_state != states[i]) {
+            if (!a->restore_audio_modification_state(a, p, id, archives[i].data(), archives[i].size())) {
+                a->end_model_update(a, p);
+                return env->NewStringUTF("Plugin rejected modification archive");
+            }
+            c.plugin_state = states[i];
+        }
     }
     for (auto it = s.tracks.begin(); it != s.tracks.end();) {
         if (std::find(tids.begin(), tids.end(), it->first) == tids.end()) {
@@ -715,7 +803,7 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
 // disabling a different source must not suppress this source's content reread.
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_verifyEditorAudio(
-        JNIEnv* env, jobject, jint clipId, jboolean postChange) {
+        JNIEnv* env, jobject, jint clipId, jboolean postChange, jdouble modificationGain) {
     if (!editor || !editor->clips.count(clipId)) return env->NewStringUTF("Missing editor clip");
     auto& s = *editor;
     std::array<float, 256> samples{};
@@ -724,6 +812,7 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_verifyEditorAud
     s.clips.at(clipId).provider->readSamples(range, destination);
     auto expected = [&](const float* data) { return std::array<float, 4>{data[0], data[1], compute_rms(data, 128), compute_peak(data, 128)}; };
     auto left = expected(samples.data()), right = expected(samples.data() + 128);
+    for (int i = 0; i < 4; ++i) { left[i] *= modificationGain; right[i] *= modificationGain; }
     bool matched = false;
     s.instance->activate();
     for (int attempt = 0; attempt < 50 && !matched; ++attempt) {
