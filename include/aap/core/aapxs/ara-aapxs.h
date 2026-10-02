@@ -255,7 +255,7 @@ namespace aap::xs {
         // Synchronously invokes a void model-edit command and logs any failure/timeout. The
         // aap_ara_extension_t functions return void, so the error cannot be propagated further;
         // logging is the only in-API way to surface it.
-        void invokeVoidEdit(int32_t opcode);
+        void invokeVoidEdit(int32_t opcode, const void* payload, size_t payloadSize);
 
     public:
         AraClientAAPXS(AAPXSInitiatorInstance* initiatorInstance, AAPXSSerializationContext* serialization)
@@ -296,6 +296,8 @@ namespace aap::xs {
             ((AraServiceAAPXS*) ext->aapxs_context)->readAudioSourceSamples(audioSourceId, sampleRange, destination);
         }
         aap_ara_host_extension_t as_host_extension{this, staticGetHostCapability, staticReadAudioSourceSamples};
+        // The samples of the last readAudioSourceSamples(); valid until the next call.
+        std::vector<uint8_t> read_samples{};
 
     public:
         AraServiceAAPXS(AAPXSInitiatorInstance* initiatorInstance, AAPXSSerializationContext* serialization)
