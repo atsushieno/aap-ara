@@ -6,6 +6,35 @@
 
 #define LOG_TAG "AAP.ARA.AAPXS"
 
+uint32_t aap::xs::AAPXSDefinition_Ara::aapxs_ara_get_request_flags(
+        AAPXSDefinition* definition, bool isHostExtension, int32_t opcode) {
+    if (isHostExtension) {
+        if (definition->process_incoming_host_aapxs_request != aapxs_ara_process_incoming_host_aapxs_request)
+            return 0;
+        switch (opcode) {
+            case OPCODE_ARA_GET_HOST_CAPABILITY:
+            case OPCODE_ARA_READ_AUDIO_SOURCE_SAMPLES:
+                return AAPXS_REQUEST_READ_ONLY;
+            default:
+                // Content updates carry payloads; none may be coalesced or dropped.
+                return 0;
+        }
+    }
+    if (definition->process_incoming_plugin_aapxs_request != aapxs_ara_process_incoming_plugin_aapxs_request)
+        return 0;
+    switch (opcode) {
+        case OPCODE_ARA_GET_FACTORY_CAPABILITY:
+        case OPCODE_ARA_STORE_MODIFICATION_STATE:
+            // Query/export does not mutate the model. It still accesses plugin
+            // state, so READ_ONLY does not grant concurrent dispatch or RT safety.
+            return AAPXS_REQUEST_READ_ONLY;
+        default:
+            // Model edits, restore and unknown requests retain control exclusion
+            // and the runtime's conservative snapshot invalidation.
+            return 0;
+    }
+}
+
 namespace {
 template <typename T>
 static inline T* asWire(AAPXSSerializationContext* serialization) {

@@ -363,6 +363,7 @@ namespace aap::xs {
                 AAPXSInitiatorInstance* aapxsInstance,
                 AAPXSSerializationContext* serialization);
         static void aapxs_ara_release_instance_context(AAPXSDefinition*, void* context);
+        static uint32_t aapxs_ara_get_request_flags(AAPXSDefinition*, bool isHostExtension, int32_t opcode);
         static void* aapxs_ara_as_plugin_extension(AAPXSExtensionClientProxy* proxy) {
             return ((AraClientAAPXS*) proxy->aapxs_context)->asPluginExtension();
         }
@@ -383,7 +384,12 @@ namespace aap::xs {
                                   // edits/reads are not real-time and (e.g. readAudioSourceSamples)
                                   // can transfer large payloads, so they must never take the SysEx8
                                   // realtime path. They are invoked asynchronously over Binder.
-                                  nullptr, nullptr, aapxs_ara_release_instance_context};
+                                  nullptr, nullptr, aapxs_ara_release_instance_context,
+                                  aapxs_ara_get_request_flags,
+                                  nullptr, // no service snapshot lifecycle hook
+                                  nullptr, // no plugin recipient-owned context
+                                  nullptr  // no outgoing-request effect
+        };
 
     public:
         AAPXSDefinition& asPublic() override { return aapxs_ara; }
