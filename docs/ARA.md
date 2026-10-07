@@ -11,6 +11,13 @@ VST3, CLAP, Audio Unit, or any other foreign plug-in API.
 
 ## Repository boundary
 
+ARA uses aap-core's role-aware AAPXS lifecycle (`docs/AAPXS_LIFECYCLE.md`).
+The dispatcher creates the canonical `AraClientAAPXS` / `AraServiceAAPXS`
+context before proxy lookup and releases it through the initiator lifecycle
+hook. Proxy getters borrow that context without lazy creation or a shared mutex.
+Rebuild ARA and its native consumers together with this SDK update; its ARA
+extension API and serialization remain unchanged.
+
 The AAP-native public API belongs in `aap-core`.
 
 If implementation work later needs the upstream ARA SDK or any companion-SDK

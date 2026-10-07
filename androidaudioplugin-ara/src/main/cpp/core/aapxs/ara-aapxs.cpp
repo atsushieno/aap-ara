@@ -448,20 +448,16 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_process_incoming_host_aapxs_reply(
 AAPXSExtensionClientProxy aap::xs::AAPXSDefinition_Ara::aapxs_ara_get_plugin_proxy(
         struct AAPXSDefinition* feature, AAPXSInitiatorInstance* aapxsInstance,
         AAPXSSerializationContext* serialization) {
-    static std::mutex creation_mutex;
-    const std::lock_guard<std::mutex> lock(creation_mutex);
-    if (!aapxsInstance->aapxs_context)
-        aapxsInstance->aapxs_context = new AraClientAAPXS(aapxsInstance, serialization);
+    (void) feature;
+    (void) serialization;
     return AAPXSExtensionClientProxy{aapxsInstance->aapxs_context, aapxs_ara_as_plugin_extension};
 }
 
 AAPXSExtensionServiceProxy aap::xs::AAPXSDefinition_Ara::aapxs_ara_get_host_proxy(
         struct AAPXSDefinition* feature, AAPXSInitiatorInstance* aapxsInstance,
         AAPXSSerializationContext* serialization) {
-    static std::mutex creation_mutex;
-    const std::lock_guard<std::mutex> lock(creation_mutex);
-    if (!aapxsInstance->aapxs_context)
-        aapxsInstance->aapxs_context = new AraServiceAAPXS(aapxsInstance, serialization);
+    (void) feature;
+    (void) serialization;
     return AAPXSExtensionServiceProxy{aapxsInstance->aapxs_context, aapxs_ara_as_host_extension};
 }
 

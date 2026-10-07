@@ -388,7 +388,11 @@ namespace aap::xs {
                                   aapxs_ara_get_request_flags,
                                   nullptr, // no service snapshot lifecycle hook
                                   nullptr, // no plugin recipient-owned context
-                                  nullptr  // no outgoing-request effect
+                                  nullptr, // no outgoing-request effect
+                                  initializeTypedAAPXSInitiator<AraClientAAPXS, AraServiceAAPXS>,
+                                  nullptr, // no recipient-owned context
+                                  releaseTypedAAPXSInitiator,
+                                  nullptr
         };
 
     public:
