@@ -8,23 +8,34 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: 21
           distribution: temurin
-      - name: set up Android SDK
-        uses: android-actions/setup-android@v3
-      - name: set up Gradle
-        uses: gradle/actions/setup-gradle@v4
       - name: publish
-        run: ./gradlew --console=plain --warning-mode=all :androidaudioplugin-ara:publishToMavenCentral :androidaudioplugin-ara:dokkaGenerate
+        run: ./gradlew --warning-mode=all publishToMavenCentral dokkaGenerate
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
-          # Store the complete ASCII-armored private key directly, as in aap-core/aap-lv2.
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_KEY_CONTENTS }}
+
+      - name: Create Release
+        uses: ncipollo/release-action@v1.21.0
+        if: success() && startsWith(github.ref, 'refs/tags/')
+        with:
+          artifacts: ./*/build/outputs/aar/*.aar,samples/*/build/outputs/apk/debug/*.apk
+      - name: deploy to GitHub Pages
+        if: success() && startsWith(github.ref, 'refs/tags/')
+        uses: JamesIves/github-pages-deploy-action@v4.8.0
+        with:
+          branch: gh-pages
+          folder: androidaudioplugin-ara/build/dokka/html
