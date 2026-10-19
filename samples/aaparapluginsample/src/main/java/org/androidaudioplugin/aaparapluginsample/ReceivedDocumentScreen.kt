@@ -39,9 +39,23 @@ fun ReceivedDocumentScreen(token: Long, instanceId: Int) {
             val text = AraPluginSampleNative.snapshot(token)
             alive = text != "null"
             val next = if (alive) JSONObject(text) else null
-            if (next?.optLong("revision") != snapshot?.optLong("revision")) snapshot = next
+            if (next?.optLong("revision") != snapshot?.optLong("revision") ||
+                next?.optLong("selectionChanges") != snapshot?.optLong("selectionChanges")) snapshot = next
             delay(150)
         }
+    }
+    val hostSelection = snapshot?.optJSONObject("selection")
+    val hostClips = hostSelection?.optJSONArray("clips")?.let { array ->
+        (0 until array.length()).map { array.getInt(it) }.toSet()
+    }.orEmpty()
+    val hostTracks = hostSelection?.optJSONArray("tracks")?.let { array ->
+        (0 until array.length()).map { array.getInt(it) }.toSet()
+    }.orEmpty()
+    val hostRange = hostSelection?.optJSONObject("range")?.let {
+        it.getDouble("start") to it.getDouble("start") + it.getDouble("duration")
+    }
+    LaunchedEffect(token, snapshot?.optLong("selectionChanges")) {
+        selectedClip = hostClips.firstOrNull()
     }
     val document = remember(snapshot) {
         ProjectDocument().apply {
@@ -68,9 +82,12 @@ fun ReceivedDocumentScreen(token: Long, instanceId: Int) {
                     Text("Instance $instanceId · Revision ${snapshot?.optLong("revision") ?: 0}",
                         color = MaterialTheme.colorScheme.primary)
                     Text("${document.tracks.size} tracks · ${document.clips.size} clips · ${snapshot?.optJSONArray("sources")?.length() ?: 0} sources")
+                    Text("Host selection: ${hostClips.size} clips · ${hostTracks.size} tracks" +
+                        (hostRange?.let { String.format(Locale.ROOT, " · %.3f–%.3fs", it.first, it.second) } ?: ""))
                     Text(if (alive) "Host arrangement and plugin sound edits synchronize automatically." else "The host has released this instance.")
                     ProjectTimeline(document, null, selectedClip, Modifier.weight(1f).fillMaxWidth(),
-                        onTrack = {}, onClip = { selectedClip = it.id }, showFrequency = false)
+                        onTrack = {}, onClip = { selectedClip = it.id }, showFrequency = false,
+                        selectedClipIds = hostClips + setOfNotNull(selectedClip), selectedTrackIds = hostTracks, timeRange = hostRange)
                     document.clips.find { it.id == selectedClip }?.let {
                         Text(String.format(Locale.ROOT, "%s · start %.3fs · source offset %.3fs · duration %.3fs",
                             it.name, it.start, it.offset, it.duration))

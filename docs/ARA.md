@@ -142,6 +142,40 @@ The first serious integration target should be an AAP DAW host such as UAPMD,
 because that is where the document model, region ownership, transport, and
 persistence already have a place to live.
 
+## Host selection notifications
+
+`AAP_ARA_FEATURE_VIEW_SELECTION` negotiates the appended `notify_selection`
+callback in `aap_ara_extension_t`. An editor-view role alone does not imply that
+the callback is present. A new host must check the returned capability size and
+feature bit before accessing it; an old plugin continues to support its existing
+document operations. No aap-core change is required.
+
+`aap_ara_view_selection_t` is a complete replacement for one document's transient
+host selection: ordered playback-region IDs, ordered region-sequence IDs, and an
+optional explicit time interval in project seconds. Empty arrays and no range
+clear selection. Equal endpoints are a point. Object selection does not imply a
+derived bounding interval, and native MIDI note/controller identities are not
+part of this AAP view protocol.
+
+The callback borrows arrays only for its duration. Receivers copy them and reject
+invalid IDs or ranges atomically. Selection must not change document content,
+revision, undo history, modification archives, or trigger content notifications.
+Hosts send after model transactions complete and resend when opening/reopening
+the editor. Removing objects prunes selection; restoring content does not reselect
+it. Keep these calls serialized with model operations, outside the audio thread.
+
+AAPXS opcode 26 carries a 48-byte header followed by the two int64 ID arrays.
+The header includes the complete byte count because legacy Binder transport does
+not convey the sender's `data_size`. The receiver checks both counts, the embedded
+size and shared-memory capacity before reading IDs. The entire payload must fit
+the extension's 1 MiB budget; oversized selections fail rather than truncate.
+The reply reports whether the plugin accepted the selection. This traffic uses
+the existing Binder control path and never MIDI/SysEx8 processing.
+
+The sample host skips superseded pending notifications on its serialized worker.
+The sample plugin publishes a separate `selectionChanges` counter, allowing its
+Compose view to refresh highlights while the document revision remains unchanged.
+
 ## Non-goals
 
 The following would be misleading:

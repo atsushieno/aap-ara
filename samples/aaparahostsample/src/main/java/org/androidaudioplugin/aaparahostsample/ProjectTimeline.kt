@@ -14,6 +14,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -31,15 +32,20 @@ private data class ClipDrag(val clip: ProjectClip, val trackIndex: Int, val exte
 @Composable
 fun ProjectTimeline(document: ProjectDocument, selectedTrackId: Int?, selectedClipId: Int?, modifier: Modifier,
                     onTrack: (Int) -> Unit, onClip: (ProjectClip) -> Unit, showFrequency: Boolean = true,
-                    onMove: ((clipId: Int, trackId: Int, start: Double) -> Unit)? = null) {
+                    onMove: ((clipId: Int, trackId: Int, start: Double) -> Unit)? = null,
+                    selectedClipIds: Set<Int> = setOfNotNull(selectedClipId),
+                    selectedTrackIds: Set<Int> = setOfNotNull(selectedTrackId),
+                    timeRange: Pair<Double, Double>? = null,
+                    onClipDragStart: ((ProjectClip) -> Unit)? = null) {
     var drag by remember { mutableStateOf<ClipDrag?>(null) }
     val currentDocument by rememberUpdatedState(document)
-    val selectClip by rememberUpdatedState(onClip)
+    val startClipDrag by rememberUpdatedState(onClipDragStart ?: onClip)
     val moveClip by rememberUpdatedState(onMove)
     val density = LocalDensity.current
     val rowHeight = with(density) { 78.dp.toPx() }
     // Freeze the scale for the gesture. A move past the old end expands it on release.
-    val extent = drag?.extent ?: max(16.0, (document.clips.maxOfOrNull { it.start + it.duration } ?: 0.0) * 1.25)
+    val extent = drag?.extent ?: max(16.0, max(document.clips.maxOfOrNull { it.start + it.duration } ?: 0.0,
+        timeRange?.second ?: 0.0) * 1.25)
     LazyColumn(modifier.background(Color(0xFF141A24)).clip(RoundedCornerShape(8.dp))) {
         item {
             Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp)) {
@@ -52,13 +58,20 @@ fun ProjectTimeline(document: ProjectDocument, selectedTrackId: Int?, selectedCl
         items(document.tracks, key = { it.id }) { track ->
             Row(Modifier.fillMaxWidth().height(78.dp).zIndex(if (drag?.clip?.track == track.id) 1f else 0f).padding(bottom = 4.dp)) {
                 Text(track.name, Modifier.width(100.dp).fillMaxHeight()
-                    .background(if (track.id == selectedTrackId) Color(0xFF344356) else Color(0xFF202A37))
+                    .background(if (track.id in selectedTrackIds) Color(0xFF344356) else Color(0xFF202A37))
                     .clickable { onTrack(track.id) }.padding(10.dp), maxLines = 2, overflow = TextOverflow.Ellipsis,
                     style = MaterialTheme.typography.labelLarge)
                 BoxWithConstraints(Modifier.weight(1f).fillMaxHeight()) {
                     val laneWidth = maxWidth
                     val laneWidthPx = with(density) { laneWidth.toPx() }
                     Canvas(Modifier.fillMaxSize()) {
+                        if (timeRange != null && (selectedTrackIds.isEmpty() || track.id in selectedTrackIds)) {
+                            val left = (timeRange.first / extent * size.width).toFloat().coerceIn(0f, size.width)
+                            val right = (timeRange.second / extent * size.width).toFloat().coerceIn(left, size.width)
+                            if (right > left)
+                                drawRect(Color(0x554E8CFF), Offset(left, 0f), Size(right - left, size.height))
+                            drawLine(Color(0xFF8DB5FF), Offset(left, 0f), Offset(left, size.height), 2f)
+                        }
                         for (i in 0..4) {
                             val x = i * size.width / 4
                             drawLine(Color(0xFF374252), Offset(x, 0f), Offset(x, size.height))
@@ -76,7 +89,7 @@ fun ProjectTimeline(document: ProjectDocument, selectedTrackId: Int?, selectedCl
                                 if (moveClip != null) detectDragGestures(
                                     onDragStart = {
                                         currentDocument.clips.find { it.id == clip.id }?.let { source ->
-                                            selectClip(source)
+                                            startClipDrag(source)
                                             drag = ClipDrag(source.copy(), currentDocument.tracks.indexOfFirst { it.id == source.track },
                                                 extent, laneWidthPx.coerceAtLeast(1f))
                                         }
@@ -100,7 +113,7 @@ fun ProjectTimeline(document: ProjectDocument, selectedTrackId: Int?, selectedCl
                                     })
                             }
                             .clip(RoundedCornerShape(6.dp))
-                            .background(if (clip.id == selectedClipId) Color(0xFFF8BA48) else Color(0xFF37AEA6))
+                            .background(if (clip.id in selectedClipIds) Color(0xFFF8BA48) else Color(0xFF37AEA6))
                             .clickable { onClip(clip) }.padding(6.dp)) {
                             Text(clip.name, color = Color(0xFF0F1E26), maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 style = MaterialTheme.typography.labelLarge)

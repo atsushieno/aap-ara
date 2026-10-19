@@ -45,6 +45,8 @@ class ProjectEditorController private constructor(private val context: Context, 
     private val undo = java.util.ArrayDeque<String>()
     private val redo = java.util.ArrayDeque<String>()
     private var historyRevision by mutableStateOf(0)
+    private var selection by mutableStateOf(ProjectSelection())
+    private val selectionGeneration = java.util.concurrent.atomic.AtomicLong()
     private val savedProject get() = java.io.File(context.filesDir, "project.json")
 
     init {
@@ -73,13 +75,15 @@ class ProjectEditorController private constructor(private val context: Context, 
         MaterialTheme(colorScheme = darkColorScheme()) {
             val revision = historyRevision
             var showPluginUi by remember { mutableStateOf(false) }
+            LaunchedEffect(showPluginUi) { if (showPluginUi) queueSelection() }
             val editorContent: @Composable () -> Unit = {
                 ProjectEditorScreen(document, busy, connected, status,
                     canUndo = revision >= 0 && undo.isNotEmpty(), canRedo = redo.isNotEmpty(),
                     onChange = ::mutate, onConnect = ::connectEditor, onSave = ::save,
                     onLoad = ::load, onUndo = { history(undo, redo) },
                     onRedo = { history(redo, undo) }, onScenario = ::runScenario,
-                    onShowPluginUi = if (context.packageName != SAMPLE_PACKAGE) ({ showPluginUi = true }) else null)
+                    onShowPluginUi = if (context.packageName != SAMPLE_PACKAGE) ({ showPluginUi = true }) else null,
+                    selection = selection, onSelection = ::select)
             }
             Surface(Modifier.fillMaxSize()) {
                 BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -144,11 +148,12 @@ class ProjectEditorController private constructor(private val context: Context, 
     }
     private fun replaceDocument(next: ProjectDocument) {
         undo.addLast(document.encode()); redo.clear(); historyRevision++
-        document = next; sync()
+        document = next; selection = selection.reconciled(document); sync()
     }
     private fun history(from: java.util.ArrayDeque<String>, to: java.util.ArrayDeque<String>) = afterPluginUpdates {
         if (from.isEmpty()) return@afterPluginUpdates
         to.addLast(document.encode()); document = ProjectDocument.decode(from.removeLast())
+        selection = selection.reconciled(document)
         historyRevision++; sync()
     }
     private fun save() = afterPluginUpdates {
@@ -157,7 +162,25 @@ class ProjectEditorController private constructor(private val context: Context, 
     }
     private fun load() = afterPluginUpdates {
         if (!busy) runCatching { ProjectDocument.decode(savedProject.readText()) }
-            .onSuccess { replaceDocument(it) }.onFailure { status = "Load failed: ${it.message}" }
+            .onSuccess { selection = ProjectSelection(); replaceDocument(it) }.onFailure { status = "Load failed: ${it.message}" }
+    }
+    private fun select(next: ProjectSelection) {
+        selection = next
+        queueSelection()
+    }
+    private fun queueSelection() {
+        if (!connected || disposed) return
+        val snapshot = selection.reconciled(document)
+        val generation = selectionGeneration.incrementAndGet()
+        // The same worker orders selection after document synchronization.
+        // Skip superseded pending selections during continuous gestures.
+        worker.execute {
+            if (generation != selectionGeneration.get()) return@execute
+            val result = snapshot.notifyPlugin()
+            if (result.isNotEmpty()) mainHandler.post {
+                if (!disposed && generation == selectionGeneration.get()) status = result
+            }
+        }
     }
     private fun sync() {
         if (!connected) { status = "${document.tracks.size} tracks • ${document.clips.size} clips • offline"; return }
@@ -167,6 +190,7 @@ class ProjectEditorController private constructor(private val context: Context, 
             val result = runCatching { snapshot.sync() }.getOrElse { it.message ?: "Sync failed" }
             mainHandler.post { if (disposed) return@post; busy = false; status = if (result.isEmpty()) "ARA model synchronized • ${snapshot.clips.size} clips" else result }
         }
+        queueSelection()
     }
     private fun connectEditor() {
         if (busy || connected) return

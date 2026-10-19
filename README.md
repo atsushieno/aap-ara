@@ -117,6 +117,14 @@ renames, timing edits, content changes and removal, remains attached to the same
 instance while the original scenario runs, and safely handles instance destruction.
 It also verifies plugin-to-host gain updates, changed diagnostic output, persisted
 archives and host restoration without notification loops.
+Host selection is sent separately from document edits. Use **Select multiple**,
+**Select all clips**, **Time range**, and **Clear selection** in either app's
+project editor. The hosted plugin highlights the selected clips, tracks and
+explicit range; it follows the primary host-selected clip for sound editing.
+Selection survives moves, is pruned on deletion, and is resent after document
+synchronization and editor reopening. It is not saved or recorded in undo history,
+and changes its own notification counter without advancing the model revision.
+Older plugins without the selection capability remain usable for document editing.
 The native view test uses a non-activity context to cover hosted sound forms.
 `PluginTransportTest` verifies
 that processing writes only audio output ports, preserving host-injected MIDI/AAPXS

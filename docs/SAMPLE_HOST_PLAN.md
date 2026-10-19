@@ -118,9 +118,12 @@ diagnostic output.
 
 ### Host UI/editor integration
 
-The same-instance hosted Compose UI is implemented. Add editor-facing state such
-as focused playback region or selection changes, if and when the AAP ARA
-contract defines those hooks.
+The same-instance hosted Compose UI and capability-negotiated host selection are
+implemented. Both sample workspaces send ordered clip/track selection and an
+optional explicit project-time range. The received-document view highlights them
+without changing model revision or archives. Selection is transient and is pruned
+on deletion; undo does not reselect removed objects. Further editor-focus APIs
+remain future work.
 
 ## Acceptance criteria for the sample
 

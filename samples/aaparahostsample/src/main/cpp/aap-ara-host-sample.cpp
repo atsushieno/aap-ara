@@ -558,6 +558,7 @@ struct EditorSession {
     std::map<int, EditorClip> clips;
     bool document_created{};
     bool supports_archive = false;
+    bool supports_selection = false;
     std::mutex updates_mutex;
     std::vector<aap_ara_content_update_t> pending_updates;
     explicit EditorSession(int rate_) : rate(rate_) {
@@ -641,6 +642,8 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_openEditor(
         session->ara->get_factory_capability(session->ara, session->plugin, &capability);
         session->supports_archive = capability.struct_size >= sizeof(capability) &&
             (capability.supported_features & AAP_ARA_FEATURE_MODIFICATION_ARCHIVE);
+        session->supports_selection = capability.struct_size >= sizeof(capability) &&
+            (capability.supported_features & AAP_ARA_FEATURE_VIEW_SELECTION);
         session->bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(session->runtime, *session->instance);
         session->instance->prepare(8, rate);
         session->ara->begin_model_update(session->ara, session->plugin, 0);
@@ -657,6 +660,34 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_openEditor(
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_closeEditor(JNIEnv*, jobject) { editor.reset(); }
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_notifyEditorSelection(
+        JNIEnv* env, jobject, jintArray clipIds, jintArray trackIds, jboolean hasRange, jdouble start, jdouble duration) {
+    if (!editor)
+        return env->NewStringUTF("Editor is not connected");
+    auto& s = *editor;
+    if (!s.supports_selection)
+        return env->NewStringUTF("Plugin does not support host selection");
+    const auto nc = env->GetArrayLength(clipIds), nt = env->GetArrayLength(trackIds);
+    // Bound Java-side allocation too; the transport has a 1 MiB shared buffer.
+    if (uint64_t(nc) + nt > (ARA_SHARED_MEMORY_SIZE - sizeof(aap_ara_view_selection_wire_t)) / sizeof(int64_t))
+        return env->NewStringUTF("Selection exceeds transport capacity");
+    std::vector<jint> clips(nc), tracks(nt);
+    env->GetIntArrayRegion(clipIds, 0, nc, clips.data());
+    env->GetIntArrayRegion(trackIds, 0, nt, tracks.data());
+    for (auto id : clips)
+        if (!s.clips.count(id))
+            return env->NewStringUTF("Unknown selected clip");
+    for (auto id : tracks)
+        if (!s.tracks.count(id))
+            return env->NewStringUTF("Unknown selected track");
+    const std::vector<int64_t> regions(clips.begin(), clips.end()), sequences(tracks.begin(), tracks.end());
+    const aap_ara_view_selection_t selection{sizeof(selection), 1,
+        static_cast<uint32_t>(regions.size()), regions.data(), static_cast<uint32_t>(sequences.size()), sequences.data(),
+        hasRange != 0, start, duration};
+    return env->NewStringUTF(s.ara->notify_selection(s.ara, s.plugin, &selection) ? "" : "Plugin rejected host selection");
+}
 
 // Drain on the editor worker, after the reverse Binder callback has returned.
 // Alternating identity/hex archive strings keep arbitrary plugin state opaque.

@@ -13,8 +13,10 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "aap/unstable/logging.h"
 
@@ -112,6 +114,11 @@ struct SamplePluginContext {
     std::mutex analysis_mutex;
     std::shared_ptr<PublishedModel> published = std::make_shared<PublishedModel>();
     uint64_t content_changes = 0;
+    uint64_t selection_changes = 0;
+    int64_t selection_document_id{};
+    std::vector<int64_t> selected_regions, selected_sequences;
+    bool selection_has_time_range{};
+    double selection_start{}, selection_duration{};
     std::map<aap_ara_document_id_t, NamedEntity> documents;
     std::map<aap_ara_musical_context_id_t, MusicalContextEntity> musical_contexts;
     std::map<aap_ara_region_sequence_id_t, RegionSequenceEntity> region_sequences;
@@ -128,12 +135,44 @@ static SamplePluginContext* get_context(AndroidAudioPlugin* plugin) {
 
 // Publish only completed transactions. The UI reads this immutable copy and
 // never touches the live ARA maps or holds a lock across reverse host callbacks.
-static void publish_model(SamplePluginContext* context) {
+static void publish_model(SamplePluginContext* context, bool contentChanged = true) {
+    const auto old_regions = context->selected_regions, old_sequences = context->selected_sequences;
+    context->selected_regions.erase(std::remove_if(context->selected_regions.begin(), context->selected_regions.end(),
+        [context](int64_t id) { return !context->playback_regions.count(id); }), context->selected_regions.end());
+    context->selected_sequences.erase(std::remove_if(context->selected_sequences.begin(), context->selected_sequences.end(),
+        [context](int64_t id) { return !context->region_sequences.count(id); }), context->selected_sequences.end());
+    if (!old_sequences.empty() && context->selected_sequences.empty())
+        context->selection_has_time_range = false;
+    const bool removed_document = context->selection_document_id && !context->documents.count(context->selection_document_id);
+    if (removed_document) {
+        context->selection_document_id = 0;
+        context->selection_has_time_range = false;
+    }
+    if (old_regions != context->selected_regions || old_sequences != context->selected_sequences || removed_document)
+        ++context->selection_changes;
     auto& snapshot = *context->published;
     std::lock_guard<std::mutex> lock(snapshot.mutex);
     std::ostringstream out;
     out.precision(17);
-    out << "{\"canEdit\":" << (context->reverse_updates_supported ? "true" : "false") << ",\"revision\":" << ++snapshot.revision << ",\"contentChanges\":" << context->content_changes;
+    if (contentChanged)
+        ++snapshot.revision;
+    out << "{\"canEdit\":" << (context->reverse_updates_supported ? "true" : "false") << ",\"revision\":" << snapshot.revision << ",\"contentChanges\":" << context->content_changes;
+    out << ",\"selectionChanges\":" << context->selection_changes << ",\"selection\":{\"clips\":[";
+    for (size_t i = 0; i < context->selected_regions.size(); ++i) {
+        if (i) out << ',';
+        out << context->selected_regions[i];
+    }
+    out << "],\"tracks\":[";
+    for (size_t i = 0; i < context->selected_sequences.size(); ++i) {
+        if (i) out << ',';
+        out << context->selected_sequences[i];
+    }
+    out << "],\"range\":";
+    if (context->selection_has_time_range)
+        out << "{\"start\":" << context->selection_start << ",\"duration\":" << context->selection_duration << '}';
+    else
+        out << "null";
+    out << '}';
     out << ",\"title\":" << json_string(context->documents.empty() ? "No ARA document" : context->documents.begin()->second.name);
     out << ",\"tracks\":[";
     bool comma = false;
@@ -320,7 +359,7 @@ static void sample_get_factory_capability(aap_ara_extension_t*, AndroidAudioPlug
     if (!destination)
         return;
     if (destination->struct_size >= sizeof(*destination))
-        destination->supported_features = AAP_ARA_FEATURE_MODIFICATION_ARCHIVE;
+        destination->supported_features = AAP_ARA_FEATURE_MODIFICATION_ARCHIVE | AAP_ARA_FEATURE_VIEW_SELECTION;
     destination->struct_size = sizeof(aap_ara_factory_capability_t);
     destination->api_generations = AAP_ARA_API_GENERATION_2;
     destination->role_flags = AAP_ARA_ROLE_PLAYBACK_RENDERER | AAP_ARA_ROLE_EDITOR_RENDERER | AAP_ARA_ROLE_EDITOR_VIEW;
@@ -551,6 +590,48 @@ static bool sample_restore_modification_state(aap_ara_extension_t*, AndroidAudio
     return true;
 }
 
+static bool sample_notify_selection(aap_ara_extension_t*, AndroidAudioPlugin* plugin, const aap_ara_view_selection_t* selection) {
+    auto* context = get_context(plugin);
+    const std::lock_guard<std::recursive_mutex> lock(context->model_mutex);
+    if (!selection || selection->struct_size < sizeof(*selection) || context->model_update_active ||
+        !context->documents.count(selection->document_id) ||
+        (selection->playback_region_count && !selection->playback_region_ids) ||
+        (selection->region_sequence_count && !selection->region_sequence_ids) ||
+        (selection->has_time_range && (!std::isfinite(selection->start) || !std::isfinite(selection->duration) ||
+            selection->duration < 0 || !std::isfinite(selection->start + selection->duration))))
+        return false;
+    std::vector<int64_t> regions, sequences;
+    std::set<int64_t> seen_regions, seen_sequences;
+    for (uint32_t i = 0; i < selection->playback_region_count; ++i) {
+        const auto id = selection->playback_region_ids[i];
+        if (!context->playback_regions.count(id))
+            return false;
+        if (seen_regions.insert(id).second)
+            regions.push_back(id);
+    }
+    for (uint32_t i = 0; i < selection->region_sequence_count; ++i) {
+        const auto id = selection->region_sequence_ids[i];
+        if (!context->region_sequences.count(id))
+            return false;
+        if (seen_sequences.insert(id).second)
+            sequences.push_back(id);
+    }
+    if (context->selected_regions == regions && context->selected_sequences == sequences &&
+        context->selection_document_id == selection->document_id &&
+        context->selection_has_time_range == selection->has_time_range &&
+        (!selection->has_time_range || (context->selection_start == selection->start && context->selection_duration == selection->duration)))
+        return true;
+    context->selected_regions = std::move(regions);
+    context->selected_sequences = std::move(sequences);
+    context->selection_document_id = selection->document_id;
+    context->selection_has_time_range = selection->has_time_range;
+    context->selection_start = selection->has_time_range ? selection->start : 0;
+    context->selection_duration = selection->has_time_range ? selection->duration : 0;
+    ++context->selection_changes;
+    publish_model(context, false);
+    return true;
+}
+
 static aap_ara_extension_t sample_ara_extension{
         nullptr,
         sample_get_factory_capability,
@@ -577,7 +658,8 @@ static aap_ara_extension_t sample_ara_extension{
         sample_update_playback_region_properties,
         sample_destroy_playback_region,
         sample_store_modification_state,
-        sample_restore_modification_state
+        sample_restore_modification_state,
+        sample_notify_selection
 };
 
 static void sample_prepare(AndroidAudioPlugin* plugin, int32_t, aap_buffer_t*) {

@@ -23,10 +23,27 @@ fun ProjectEditorScreen(
     canUndo: Boolean, canRedo: Boolean, onChange: (ProjectDocument.() -> Unit) -> Unit,
     onConnect: () -> Unit, onSave: () -> Unit, onLoad: () -> Unit,
     onUndo: () -> Unit, onRedo: () -> Unit, onScenario: () -> Unit,
-    onShowPluginUi: (() -> Unit)? = null
+    onShowPluginUi: (() -> Unit)? = null,
+    selection: ProjectSelection? = null, onSelection: ((ProjectSelection) -> Unit)? = null
 ) {
-    var selectedTrackId by remember { mutableStateOf<Int?>(null) }
-    var selectedClipId by remember { mutableStateOf<Int?>(null) }
+    var localSelection by remember { mutableStateOf(ProjectSelection()) }
+    val currentSelection = selection ?: localSelection
+    fun select(next: ProjectSelection) { localSelection = next; onSelection?.invoke(next) }
+    val selectedClipId = currentSelection.clips.firstOrNull()
+    val selectedTrackId = currentSelection.tracks.firstOrNull()
+        ?: document.clips.find { it.id == selectedClipId }?.track
+    var multiple by remember { mutableStateOf(false) }
+    var editRange by remember { mutableStateOf(false) }
+    fun selectTrack(id: Int) {
+        select(if (multiple) currentSelection.copy(tracks =
+            if (id in currentSelection.tracks) currentSelection.tracks - id else listOf(id) + currentSelection.tracks)
+        else ProjectSelection(tracks = listOf(id)))
+    }
+    fun selectClip(c: ProjectClip) {
+        select(if (multiple) currentSelection.copy(clips =
+            if (c.id in currentSelection.clips) currentSelection.clips - c.id else listOf(c.id) + currentSelection.clips)
+        else ProjectSelection(clips = listOf(c.id)))
+    }
     val track = document.tracks.find { it.id == selectedTrackId } ?: document.tracks.firstOrNull()
     val clip = document.clips.find { it.id == selectedClipId }
     var nameEdit by remember { mutableStateOf<Pair<Int?, String>?>(null) }
@@ -41,7 +58,7 @@ fun ProjectEditorScreen(
                 color = MaterialTheme.colorScheme.primary)
             Toolbar {
                 EditorButton(if (connected) "Connected" else "Connect", !busy && !connected, onConnect)
-                EditorButton("New", !busy) { onChange { title = "Untitled Project"; clips.clear(); tracks.clear() }; selectedClipId = null }
+                EditorButton("New", !busy) { select(ProjectSelection()); onChange { title = "Untitled Project"; clips.clear(); tracks.clear() } }
                 EditorButton("Rename project", !busy) { nameEdit = null to document.title }
                 EditorButton("Save", !busy, onSave)
                 EditorButton("Load", !busy, onLoad)
@@ -50,7 +67,7 @@ fun ProjectEditorScreen(
                 Box {
                     EditorButton(track?.name ?: "Choose track", !busy && document.tracks.isNotEmpty()) { trackMenu = true }
                     DropdownMenu(trackMenu, { trackMenu = false }) {
-                        document.tracks.forEach { t -> DropdownMenuItem(text = { Text(t.name) }, onClick = { selectedTrackId = t.id; trackMenu = false }) }
+                        document.tracks.forEach { t -> DropdownMenuItem(text = { Text(t.name) }, onClick = { selectTrack(t.id); trackMenu = false }) }
                     }
                 }
                 EditorButton("Add track", !busy) { nameEdit = -1 to "Track ${document.tracks.size + 1}" }
@@ -65,11 +82,11 @@ fun ProjectEditorScreen(
                         onChange { clips.find { it.id == c.id }?.let { source ->
                             clips.add(source.copy(id = nextId++, start = source.start + source.duration, name = "${source.name} copy"))
                         } }
-                        selectedClipId = id
+                        select(ProjectSelection(clips = listOf(id)))
                     }
                 }
                 EditorButton("Remove clip", !busy && clip != null) {
-                    clip?.let { c -> onChange { clips.removeAll { it.id == c.id } }; selectedClipId = null }
+                    clip?.let { c -> onChange { clips.removeAll { it.id == c.id } }; select(currentSelection.copy(clips = currentSelection.clips - c.id)) }
                 }
             }
             Toolbar {
@@ -78,15 +95,25 @@ fun ProjectEditorScreen(
                 EditorButton("Run Scenario", !busy, onScenario)
                 onShowPluginUi?.let { EditorButton("Show plugin UI", !busy && connected, it) }
             }
+            Toolbar {
+                EditorButton(if (multiple) "Multiple: on" else "Select multiple", !busy) { multiple = !multiple }
+                EditorButton("Select all clips", !busy) { select(currentSelection.copy(clips = document.clips.map { it.id })) }
+                EditorButton("Time range", !busy) { editRange = true }
+                EditorButton("Clear selection", !busy) { select(ProjectSelection()) }
+            }
+            Text("Selection: ${currentSelection.clips.size} clips · ${currentSelection.tracks.size} tracks" +
+                (currentSelection.timeRange?.let { " · ${it.first}–${it.second}s" } ?: ""), style = MaterialTheme.typography.labelSmall)
             Text("Generated stereo tones · source length 60s · diagnostic audio output", style = MaterialTheme.typography.labelSmall)
             Text("Drag clips to move them in time or between tracks · Plugin edits: ${document.clips.count { it.pluginState.isNotEmpty() }} clips",
                 style = MaterialTheme.typography.labelSmall)
             ProjectTimeline(document, selectedTrackId = track?.id, selectedClipId = selectedClipId,
-                modifier = Modifier.weight(1f).fillMaxWidth(), onTrack = { selectedTrackId = it },
-                onClip = { selectedClipId = it.id; selectedTrackId = it.track },
+                modifier = Modifier.weight(1f).fillMaxWidth(), onTrack = { if (!busy) selectTrack(it) },
+                onClip = { if (!busy) selectClip(it) },
+                selectedClipIds = currentSelection.clips.toSet(), selectedTrackIds = currentSelection.tracks.toSet(),
+                timeRange = currentSelection.timeRange,
+                onClipDragStart = { c -> if (c.id !in currentSelection.clips) selectClip(c) },
                 onMove = if (busy) null else { id, target, position ->
                     onChange { clips.find { it.id == id }?.let { it.track = target; it.start = position } }
-                    selectedTrackId = target
                 })
             if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(8.dp)) {
@@ -100,7 +127,7 @@ fun ProjectEditorScreen(
         AlertDialog(onDismissRequest = { nameEdit = null }, title = { Text(if (id == null) "Project name" else "Track name") },
             text = { OutlinedTextField(value, { value = it }, label = { Text("Name") }, singleLine = true) },
             confirmButton = { TextButton(enabled = value.isNotBlank() && !busy, onClick = {
-                if (id == -1) selectedTrackId = document.nextId
+                if (id == -1) select(ProjectSelection(tracks = listOf(document.nextId)))
                 onChange {
                     when (id) {
                         null -> title = value.trim()
@@ -125,8 +152,25 @@ fun ProjectEditorScreen(
                 if (index >= 0) clips[index] = edited.copy(pluginState = clips[index].pluginState) else clips.add(edited)
                 if (fresh) nextId++
             }
-            selectedClipId = edited.id; selectedTrackId = edited.track; clipEdit = null
+            select(ProjectSelection(clips = listOf(edited.id))); clipEdit = null
         })
+    }
+    if (editRange) {
+        var start by remember { mutableStateOf((currentSelection.timeRange?.first ?: 0.0).toString()) }
+        var end by remember { mutableStateOf((currentSelection.timeRange?.second ?: 4.0).toString()) }
+        val a = start.toDoubleOrNull()
+        val b = end.toDoubleOrNull()
+        val valid = a != null && b != null && a.isFinite() && b.isFinite() && a >= 0 && b >= a
+        AlertDialog(onDismissRequest = { editRange = false }, title = { Text("Time range") }, text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(if (currentSelection.tracks.isEmpty()) "All tracks" else "Selected tracks")
+                NumberField("Range start (seconds)", start) { start = it }
+                NumberField("Range end (seconds)", end) { end = it }
+                Text("Equal endpoints select a point.")
+            }
+        }, confirmButton = { TextButton(enabled = valid && !busy, onClick = {
+            select(currentSelection.copy(timeRange = a!! to b!!)); editRange = false
+        }) { Text("Apply range") } }, dismissButton = { TextButton(onClick = { editRange = false }) { Text("Cancel") } })
     }
 }
 

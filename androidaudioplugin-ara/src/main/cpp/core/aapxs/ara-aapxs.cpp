@@ -1,6 +1,7 @@
 #include "aap/core/aapxs/ara-aapxs.h"
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include "aap/unstable/logging.h"
 
@@ -338,6 +339,38 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_process_incoming_plugin_aapxs_reque
             if (ext && ext->destroy_playback_region)
                 ext->destroy_playback_region(ext, plugin, asWire<aap_ara_object_id_wire_t>(serialization)->object_id);
             break;
+        case OPCODE_ARA_NOTIFY_SELECTION: {
+            if (!serialization->data || serialization->data_capacity < sizeof(aap_ara_view_selection_wire_t))
+                break;
+            auto* wire = asWire<aap_ara_view_selection_wire_t>(serialization);
+            wire->succeeded = 0;
+            const uint64_t count = uint64_t(wire->playback_region_count) + wire->region_sequence_count;
+            const uint64_t size = sizeof(*wire) + count * sizeof(int64_t);
+            aap_ara_factory_capability_t capability{};
+            capability.struct_size = sizeof(capability);
+            if (ext && ext->get_factory_capability)
+                ext->get_factory_capability(ext, plugin, &capability);
+            if (size == wire->payload_size && size <= serialization->data_capacity &&
+                wire->has_time_range <= 1 && (!wire->has_time_range ||
+                    (std::isfinite(wire->start) && std::isfinite(wire->duration) && wire->duration >= 0 &&
+                     std::isfinite(wire->start + wire->duration))) &&
+                capability.struct_size >= sizeof(capability) &&
+                (capability.supported_features & AAP_ARA_FEATURE_VIEW_SELECTION) && ext->notify_selection) {
+                // Copy the IDs before invoking the plugin. No borrowed wire pointer
+                // escapes into plugin-owned state or a nested extension call.
+                std::vector<int64_t> ids(count);
+                if (count)
+                    memcpy(ids.data(), wire + 1, count * sizeof(int64_t));
+                const aap_ara_view_selection_t selection{sizeof(selection), wire->document_id,
+                    wire->playback_region_count, wire->playback_region_count ? ids.data() : nullptr,
+                    wire->region_sequence_count, wire->region_sequence_count ? ids.data() + wire->playback_region_count : nullptr,
+                    wire->has_time_range != 0, wire->start, wire->duration};
+                wire->succeeded = ext->notify_selection(ext, plugin, &selection);
+            }
+            serialization->data_size = sizeof(*wire);
+            aapxsInstance->send_aapxs_reply(aapxsInstance, request);
+            return;
+        }
         case OPCODE_ARA_STORE_MODIFICATION_STATE:
         case OPCODE_ARA_RESTORE_MODIFICATION_STATE: {
             // Binder carries the fixed shared-memory record, but not the
@@ -699,6 +732,35 @@ bool aap::xs::AraClientAAPXS::restoreModificationState(int64_t id, const void* d
     auto result = callAndWait<aap_ara_archive_wire_t>(OPCODE_ARA_RESTORE_MODIFICATION_STATE, &wire, sizeof(wire),
             [](AAPXSSerializationContext* ctx) { return *asWire<aap_ara_archive_wire_t>(ctx); }, sizeof(wire));
     return result.isOk() && result.value.succeeded;
+}
+
+bool aap::xs::AraClientAAPXS::notifySelection(const aap_ara_view_selection_t& selection) {
+    if (selection.struct_size < sizeof(selection) ||
+        (selection.playback_region_count && !selection.playback_region_ids) ||
+        (selection.region_sequence_count && !selection.region_sequence_ids) ||
+        (selection.has_time_range && (!std::isfinite(selection.start) || !std::isfinite(selection.duration) ||
+            selection.duration < 0 || !std::isfinite(selection.start + selection.duration))))
+        return false;
+    const uint64_t count = uint64_t(selection.playback_region_count) + selection.region_sequence_count;
+    const uint64_t size = sizeof(aap_ara_view_selection_wire_t) + count * sizeof(int64_t);
+    if (size > ARA_SHARED_MEMORY_SIZE)
+        return false;
+    const aap_ara_view_selection_wire_t wire{static_cast<uint32_t>(size), selection.playback_region_count, selection.region_sequence_count,
+        selection.has_time_range ? 1u : 0u, selection.document_id,
+        selection.has_time_range ? selection.start : 0, selection.has_time_range ? selection.duration : 0, 0, 0};
+    std::vector<uint8_t> payload(size);
+    memcpy(payload.data(), &wire, sizeof(wire));
+    auto* ids = payload.data() + sizeof(wire);
+    if (selection.playback_region_count)
+        memcpy(ids, selection.playback_region_ids, selection.playback_region_count * sizeof(int64_t));
+    if (selection.region_sequence_count)
+        memcpy(ids + selection.playback_region_count * sizeof(int64_t), selection.region_sequence_ids, selection.region_sequence_count * sizeof(int64_t));
+    auto result = callAndWait<bool>(OPCODE_ARA_NOTIFY_SELECTION, payload.data(), size,
+        [](AAPXSSerializationContext* ctx) {
+            return ctx->data_size >= sizeof(aap_ara_view_selection_wire_t) &&
+                asWire<aap_ara_view_selection_wire_t>(ctx)->succeeded == 1;
+        }, sizeof(aap_ara_view_selection_wire_t));
+    return result.isOk() && result.value;
 }
 
 void aap::xs::AraServiceAAPXS::notifyContentChanged(const aap_ara_content_update_t& update) {

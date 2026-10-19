@@ -30,6 +30,7 @@ const int32_t OPCODE_ARA_UPDATE_PLAYBACK_REGION_PROPERTIES = 22;
 const int32_t OPCODE_ARA_DESTROY_PLAYBACK_REGION = 23;
 const int32_t OPCODE_ARA_STORE_MODIFICATION_STATE = 24;
 const int32_t OPCODE_ARA_RESTORE_MODIFICATION_STATE = 25;
+const int32_t OPCODE_ARA_NOTIFY_SELECTION = 26;
 
 // host extension opcodes
 const int32_t OPCODE_ARA_GET_HOST_CAPABILITY = -1;
@@ -49,6 +50,22 @@ struct aap_ara_archive_wire_t {
  * immediately following a small response header.
  */
 const int32_t ARA_SHARED_MEMORY_SIZE = 0x100000; // 1M
+
+// Followed by playback-region IDs, then region-sequence IDs (all int64_t).
+// Binder does not convey serialization.data_size, so payload_size and both
+// counts must be validated against data_capacity before accessing any IDs.
+struct aap_ara_view_selection_wire_t {
+    uint32_t payload_size;
+    uint32_t playback_region_count;
+    uint32_t region_sequence_count;
+    uint32_t has_time_range;
+    int64_t document_id;
+    double start;
+    double duration;
+    uint32_t succeeded;
+    uint32_t reserved;
+};
+static_assert(sizeof(aap_ara_view_selection_wire_t) == 48);
 
 typedef struct aap_ara_optional_color_wire_t {
     bool has_color;
@@ -240,6 +257,9 @@ namespace aap::xs {
         static bool staticRestoreModificationState(aap_ara_extension_t* ext, AndroidAudioPlugin*, int64_t id, const void* data, size_t size) {
             return ((AraClientAAPXS*) ext->aapxs_context)->restoreModificationState(id, data, size);
         }
+        static bool staticNotifySelection(aap_ara_extension_t* ext, AndroidAudioPlugin*, const aap_ara_view_selection_t* selection) {
+            return selection && ((AraClientAAPXS*) ext->aapxs_context)->notifySelection(*selection);
+        }
 
         aap_ara_extension_t as_plugin_extension {
                 this,
@@ -267,7 +287,8 @@ namespace aap::xs {
                 staticUpdatePlaybackRegionProperties,
                 staticDestroyPlaybackRegion,
                 staticStoreModificationState,
-                staticRestoreModificationState
+                staticRestoreModificationState,
+                staticNotifySelection
         };
 
         // Synchronously invokes a void model-edit command and logs any failure/timeout. The
@@ -304,6 +325,7 @@ namespace aap::xs {
         void destroyPlaybackRegion(aap_ara_playback_region_id_t playbackRegionId);
         bool storeModificationState(int64_t id, aap_ara_archive_buffer_t& destination);
         bool restoreModificationState(int64_t id, const void* data, size_t size);
+        bool notifySelection(const aap_ara_view_selection_t& selection);
 
         aap_ara_extension_t* asPluginExtension() { return &as_plugin_extension; }
     };

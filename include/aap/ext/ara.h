@@ -17,7 +17,10 @@ extern "C" {
 #define AAP_ARA_MAX_ARCHIVE_BYTES 4096
 
 /* Optional, capability-negotiated additions to the experimental AAP binding. */
-enum { AAP_ARA_FEATURE_MODIFICATION_ARCHIVE = 1u << 0 };
+enum {
+    AAP_ARA_FEATURE_MODIFICATION_ARCHIVE = 1u << 0,
+    AAP_ARA_FEATURE_VIEW_SELECTION = 1u << 1
+};
 enum { AAP_ARA_HOST_SUPPORTS_CONTENT_UPDATES = 1u << 0 };
 enum {
     AAP_ARA_CONTENT_AUDIO_SOURCE = 1,
@@ -202,6 +205,26 @@ typedef struct aap_ara_content_update_t {
     aap_ara_time_duration_t duration;
 } aap_ara_content_update_t;
 
+/* A complete replacement of transient host selection for this document's editor
+ * view. IDs are ordered by relevance; counts may be zero (clear selection).
+ * A range is explicit project time in seconds, not a bounding box of the IDs.
+ * A zero duration is a point. When has_time_range is false, start/duration are
+ * ignored. Arrays are borrowed only for the callback; recipients must copy them.
+ * Selection never changes document content, revision, archives or undo history.
+ * Hosts serialize this notification with model operations, after end_model_update.
+ * They should send the current selection when opening/reopening an editor view. */
+typedef struct aap_ara_view_selection_t {
+    uint32_t struct_size;
+    aap_ara_document_id_t document_id;
+    uint32_t playback_region_count;
+    const aap_ara_playback_region_id_t* playback_region_ids;
+    uint32_t region_sequence_count;
+    const aap_ara_region_sequence_id_t* region_sequence_ids;
+    bool has_time_range;
+    aap_ara_time_position_t start;
+    aap_ara_time_duration_t duration;
+} aap_ara_view_selection_t;
+
 /*
  * The plug-in extension is driven by the host. The host uses it to construct
  * and mutate the ARA model graph owned by the plug-in.
@@ -352,6 +375,12 @@ typedef struct aap_ara_extension_t {
     RT_UNSAFE bool (*restore_audio_modification_state)(struct aap_ara_extension_t* ext,
             AndroidAudioPlugin* plugin, aap_ara_audio_modification_id_t id,
             const void* data, size_t data_size);
+
+    /* Access only after negotiating AAP_ARA_FEATURE_VIEW_SELECTION. Returns false
+     * for unsupported/invalid selections or transport failure; never truncates.
+     * This is an editor notification, not a model-edit transaction. */
+    RT_UNSAFE bool (*notify_selection)(struct aap_ara_extension_t* ext,
+            AndroidAudioPlugin* plugin, const aap_ara_view_selection_t* selection);
 } aap_ara_extension_t;
 
 /*
