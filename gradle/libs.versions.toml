@@ -1,7 +1,7 @@
 [versions]
 
 aap-core = "0.12.0"
-aap-ara = "0.1.0-SNAPSHOT"
+aap-ara = "0.1.0"
 
 android-compileSdk = "37"
 android-minSdk = "29"
