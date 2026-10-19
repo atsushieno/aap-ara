@@ -1,5 +1,6 @@
 package org.androidaudioplugin.aaparahostsample
 
+import android.os.Build
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -16,6 +17,13 @@ import org.androidaudioplugin.hosting.AudioPluginSurfaceControlClient
 /** Embeds the UI of the same remote instance that receives this host's edits. */
 @Composable
 fun HostedPluginPanel(instanceId: Int, onClose: () -> Unit) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+        Column {
+            Text("Hosted plugin UI requires Android 11 or later.")
+            TextButton(onClick = onClose) { Text("Hide plugin UI") }
+        }
+        return
+    }
     val context = LocalContext.current
     val client = remember(instanceId, context) { AudioPluginSurfaceControlClient(context) }
     var size by remember { mutableStateOf(IntSize.Zero) }
