@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <stdexcept>
 #include "aap/unstable/logging.h"
 
 #define LOG_TAG "AAP.ARA.AAPXS"
@@ -88,6 +89,7 @@ static inline void packMusicalContextProperties(aap_ara_musical_context_properti
     copyString(wire.name, sizeof(wire.name), properties->name);
     copyString(wire.persistent_id, sizeof(wire.persistent_id), properties->persistent_id);
     packColor(wire.color, properties->color);
+    wire.order_index = properties->order_index;
 }
 
 static inline aap_ara_musical_context_properties_t unpackMusicalContextProperties(const aap_ara_musical_context_properties_wire_t& wire, aap_ara_color_t& colorScratch) {
@@ -95,7 +97,8 @@ static inline aap_ara_musical_context_properties_t unpackMusicalContextPropertie
             sizeof(aap_ara_musical_context_properties_t),
             wire.name[0] ? wire.name : nullptr,
             unpackColor(wire.color, colorScratch),
-            wire.persistent_id[0] ? wire.persistent_id : nullptr
+            wire.persistent_id[0] ? wire.persistent_id : nullptr,
+            wire.order_index
     };
 }
 
@@ -132,6 +135,10 @@ static inline void packAudioSourceProperties(aap_ara_audio_source_properties_wir
     wire.channel_count = properties->channel_count;
     wire.merits_64_bit_samples = properties->merits_64_bit_samples;
     copyString(wire.channel_layout_tag, sizeof(wire.channel_layout_tag), properties->channel_layout_tag);
+    wire.channel_arrangement_type = properties->channel_arrangement_type;
+    wire.channel_arrangement_size = properties->channel_arrangement_size;
+    if (properties->channel_arrangement_size <= sizeof(wire.channel_arrangement) && properties->channel_arrangement)
+        memcpy(wire.channel_arrangement, properties->channel_arrangement, properties->channel_arrangement_size);
 }
 
 static inline aap_ara_audio_source_properties_t unpackAudioSourceProperties(const aap_ara_audio_source_properties_wire_t& wire) {
@@ -143,7 +150,10 @@ static inline aap_ara_audio_source_properties_t unpackAudioSourceProperties(cons
             wire.sample_rate,
             wire.channel_count,
             wire.merits_64_bit_samples,
-            wire.channel_layout_tag[0] ? wire.channel_layout_tag : nullptr
+            wire.channel_layout_tag[0] ? wire.channel_layout_tag : nullptr,
+            wire.channel_arrangement_type,
+            wire.channel_arrangement_size <= sizeof(wire.channel_arrangement) ? wire.channel_arrangement_size : 0,
+            wire.channel_arrangement_size <= sizeof(wire.channel_arrangement) ? wire.channel_arrangement : nullptr
     };
 }
 
@@ -199,7 +209,25 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_process_incoming_plugin_aapxs_reque
     auto* serialization = request->serialization;
     aap_ara_color_t colorScratch{};
 
+    uint32_t succeeded = 1;
+    try {
+    if (!ext) throw std::runtime_error("ARA transport is unavailable");
     switch (request->opcode) {
+        case OPCODE_ARA_SDK_COMMAND: {
+            // The first word is the self-described size (Binder does not carry data_size).
+            uint32_t size{};
+            if (serialization->data && serialization->data_capacity >= sizeof(size))
+                memcpy(&size, serialization->data, sizeof(size));
+            aap_ara_factory_capability_t cap{}; cap.struct_size = sizeof(cap);
+            if (ext && ext->get_factory_capability) ext->get_factory_capability(ext, plugin, &cap);
+            if (size >= 16 && size <= serialization->data_capacity &&
+                (cap.supported_features & AAP_ARA_FEATURE_ARA_SDK) && ext->sdk_command &&
+                ext->sdk_command(ext, plugin, serialization->data, size))
+                serialization->data_size = size;
+            else serialization->data_size = 0;
+            aapxsInstance->send_aapxs_reply(aapxsInstance, request);
+            return;
+        }
         case OPCODE_ARA_GET_FACTORY_CAPABILITY: {
             auto capability = aap_ara_factory_capability_t{};
             capability.struct_size = sizeof(aap_ara_factory_capability_t);
@@ -397,10 +425,14 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_process_incoming_plugin_aapxs_reque
             return;
         }
         default:
-            break;
+            succeeded = 0; break;
     }
-
-    serialization->data_size = 0;
+    } catch (const std::exception& error) {
+        succeeded = 0;
+        aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA SDK model request failed: %s", error.what());
+    } catch (...) { succeeded = 0; }
+    if (serialization->data_capacity >= sizeof(succeeded)) std::memcpy(serialization->data, &succeeded, sizeof(succeeded));
+    serialization->data_size = sizeof(succeeded);
     aapxsInstance->send_aapxs_reply(aapxsInstance, request);
 }
 
@@ -410,6 +442,16 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_process_incoming_host_aapxs_request
     auto ext = (aap_ara_host_extension_t*) host->get_extension(host, AAP_ARA_EXTENSION_URI);
     auto* serialization = request->serialization;
     switch (request->opcode) {
+        case OPCODE_ARA_HOST_SDK_COMMAND: {
+            uint32_t size{};
+            if (serialization->data && serialization->data_capacity >= sizeof(size)) memcpy(&size, serialization->data, sizeof(size));
+            aap_ara_host_capability_t cap{}; cap.struct_size = sizeof(cap);
+            if (ext && ext->get_host_capability) ext->get_host_capability(ext, host, &cap);
+            serialization->data_size = size >= 16 && size <= serialization->data_capacity &&
+                (cap.supported_model_updates & AAP_ARA_HOST_SUPPORTS_SDK) && ext->sdk_command &&
+                ext->sdk_command(ext, host, serialization->data, size) ? size : 0;
+            aapxsInstance->send_aapxs_reply(aapxsInstance, request); return;
+        }
         case OPCODE_ARA_GET_HOST_CAPABILITY: {
             auto capability = aap_ara_host_capability_t{};
             capability.struct_size = sizeof(aap_ara_host_capability_t);
@@ -499,10 +541,13 @@ void aap::xs::AAPXSDefinition_Ara::aapxs_ara_release_instance_context(AAPXSDefin
 }
 
 void aap::xs::AraClientAAPXS::invokeVoidEdit(int32_t opcode, const void* payload, size_t payloadSize) {
-    auto result = callAndWait<bool>(opcode, payload, payloadSize, [](AAPXSSerializationContext*) { return true; }, 0);
-    if (!result.isOk())
-        aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA model edit (opcode %d) failed: %s",
-                     opcode, result.error.c_str());
+    auto result = callAndWait<bool>(opcode, payload, payloadSize, [](AAPXSSerializationContext* ctx) {
+        uint32_t succeeded{};
+        if (ctx->data_size == sizeof(succeeded)) std::memcpy(&succeeded, ctx->data, sizeof(succeeded));
+        return succeeded == 1;
+    }, sizeof(uint32_t));
+    if (!result.isOk() || !result.value)
+        throw std::runtime_error("ARA model request failed (opcode " + std::to_string(opcode) + "): " + result.error);
 }
 
 void aap::xs::AraClientAAPXS::getFactoryCapability(aap_ara_factory_capability_t& destination) {
@@ -767,4 +812,24 @@ void aap::xs::AraServiceAAPXS::notifyContentChanged(const aap_ara_content_update
     auto result = callAndWait<bool>(OPCODE_ARA_NOTIFY_CONTENT_CHANGED, &update, sizeof(update),
             [](AAPXSSerializationContext*) { return true; }, 0);
     if (!result.isOk()) aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA content update failed: %s", result.error.c_str());
+}
+
+bool aap::xs::AraClientAAPXS::sdkCommand(void* data, uint32_t size) {
+    if (!data || size < 16 || size > ARA_SHARED_MEMORY_SIZE) return false;
+    auto result = callAndWait<bool>(OPCODE_ARA_SDK_COMMAND, data, size,
+        [data, size](AAPXSSerializationContext* ctx) {
+            if (ctx->data_size != size) return false;
+            memcpy(data, ctx->data, size); return true;
+        }, size);
+    return result.isOk() && result.value;
+}
+
+bool aap::xs::AraServiceAAPXS::sdkCommand(void* data, uint32_t size) {
+    if (!data || size < 16 || size > ARA_SHARED_MEMORY_SIZE) return false;
+    auto result = callAndWait<bool>(OPCODE_ARA_HOST_SDK_COMMAND, data, size,
+        [data, size](AAPXSSerializationContext* ctx) {
+            if (ctx->data_size != size) return false;
+            memcpy(data, ctx->data, size); return true;
+        }, size);
+    return result.isOk() && result.value;
 }

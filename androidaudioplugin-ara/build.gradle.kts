@@ -48,7 +48,7 @@ android {
 
     prefab {
         create("androidaudioplugin-ara") {
-            headers = "../include"
+            headers = layout.buildDirectory.dir("araaap-headers").get().asFile.path
             name = "androidaudioplugin-ara"
         }
     }
@@ -91,4 +91,16 @@ mavenPublishing {
             }
         }
     }
+}
+
+val prepareAraHeaders by tasks.registering(Sync::class) {
+    from("../include")
+    from("../external/ARA_SDK/ARA_API") {
+        include("ARAInterface.h", "ARAAudioFileChunks.h", "LICENSE.txt")
+        into("ARA_API")
+    }
+    into(layout.buildDirectory.dir("araaap-headers"))
+}
+tasks.configureEach {
+    if (name.startsWith("prefab") || name == "preBuild") dependsOn(prepareAraHeaders)
 }

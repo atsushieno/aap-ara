@@ -47,7 +47,7 @@ class ReceivedDocumentTest {
                 // The real SurfaceControl view service also supplies a non-activity
                 // context. Sound forms must not require an activity window token.
                 view = AudioPluginServiceHelper.createNativeView(context.applicationContext, pluginId, instanceId)
-                token = AraPluginSampleNative.resolveSnapshot(AudioPluginServiceHelper.getServiceInstance(pluginId), instanceId)
+                token = view!!.tag as Long
             }
             assertTrue(token > 0)
             compose.setContent { AndroidView(factory = { view!! }, modifier = Modifier.fillMaxSize()) }
@@ -127,7 +127,13 @@ class ReceivedDocumentTest {
             assertEquals("", AraHostSampleNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
             val loaded = ProjectDocument.decode(savedPluginEdit)
             assertEquals("", loaded.sync())
-            val restoredToken = AraPluginSampleNative.resolveSnapshot(AudioPluginServiceHelper.getServiceInstance(pluginId), AraHostSampleNative.editorInstanceId())
+            var restoredToken = 0L
+            compose.runOnUiThread {
+                val restoredId = AraHostSampleNative.editorInstanceId()
+                val restoredView = AudioPluginServiceHelper.createNativeView(context.applicationContext, pluginId, restoredId)
+                restoredToken = restoredView.tag as Long
+                AudioPluginServiceHelper.maybeDestroyNativeView(context, pluginId, restoredId, restoredView)
+            }
             assertNotEquals(token, restoredToken)
             assertEquals(0.5, JSONObject(AraPluginSampleNative.snapshot(restoredToken)).getJSONArray("clips").getJSONObject(0).getDouble("modificationGain"), 0.0)
             assertEquals("", AraHostSampleNative.verifyEditorAudio(loaded.clips[0].id, false, 0.5))

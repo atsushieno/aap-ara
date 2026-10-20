@@ -17,6 +17,8 @@ class AraPluginViewFactory : AudioPluginViewFactory() {
     override fun createView(context: Context, pluginId: String, instanceId: Int): View {
         val token = AraPluginSampleNative.resolveSnapshot(AudioPluginServiceHelper.getServiceInstance(pluginId), instanceId)
         return ComposeView(context).apply {
+            // Resolve inside aap-core's instance scope, including private endpoints.
+            tag = token
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
             setContent { ReceivedDocumentScreen(token, instanceId) }
         }

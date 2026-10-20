@@ -2,7 +2,8 @@
 #include <aap/android-audio-plugin.h>
 #include <aap/core/host/plugin-host.h>
 #include <memory>
-#include <aap/ext/ara.h>
+#include <aap/ara/araaap.hpp>
+#include <ARA_Library/PlugIn/ARAPlug.h>
 #include <aap/ext/plugin-info.h>
 #include <algorithm>
 #include <array>
@@ -46,7 +47,10 @@ std::string json_string(const std::string& text) {
 }
 }
 
-extern "C" {
+using namespace ARA;
+using namespace ARA::PlugIn;
+using aap::ara::hostID;
+using aap::ara::hostRef;
 
 struct NamedEntity {
     std::string name;
@@ -55,45 +59,49 @@ struct NamedEntity {
 
 struct MusicalContextEntity : public NamedEntity {
     bool has_color{};
-    aap_ara_color_t color{};
+    ARAColor color{};
 };
 
 struct RegionSequenceEntity : public MusicalContextEntity {
     int32_t order_index{};
-    aap_ara_musical_context_id_t musical_context_id{};
+    int64_t musical_context_id{};
 };
 
 struct AudioSourceEntity : public NamedEntity {
     double rms = 0.0;
-    aap_ara_sample_count_t sample_count{};
-    aap_ara_sample_rate_t sample_rate{};
+    ARASampleCount sample_count{};
+    ARASampleRate sample_rate{};
     int32_t channel_count{};
     bool merits_64_bit_samples{};
     std::string channel_layout_tag;
     bool samples_access_enabled{};
-    aap_ara_sample_position_t changed_start_sample{};
-    aap_ara_sample_count_t changed_sample_count{};
+    ARASamplePosition changed_start_sample{};
+    ARASampleCount changed_sample_count{};
 };
 
 struct AudioModificationEntity : public NamedEntity {
     double gain = 1.0;
-    aap_ara_audio_source_id_t audio_source_id{};
+    int64_t audio_source_id{};
 };
 
 struct PlaybackRegionEntity {
     uint32_t transformation_flags{};
-    aap_ara_time_position_t start_in_modification_time{};
-    aap_ara_time_duration_t duration_in_modification_time{};
-    aap_ara_time_position_t start_in_playback_time{};
-    aap_ara_time_duration_t duration_in_playback_time{};
-    aap_ara_region_sequence_id_t region_sequence_id{};
+    ARATimePosition start_in_modification_time{};
+    ARATimeDuration duration_in_modification_time{};
+    ARATimePosition start_in_playback_time{};
+    ARATimeDuration duration_in_playback_time{};
+    int64_t region_sequence_id{};
     std::string name;
     bool has_color{};
-    aap_ara_color_t color{};
-    aap_ara_audio_modification_id_t audio_modification_id{};
+    ARAColor color{};
+    int64_t audio_modification_id{};
 };
 
+class SampleDocumentController;
+
 struct SamplePluginContext {
+    std::unique_ptr<ARA::PlugIn::PlugInExtension> binding = std::make_unique<ARA::PlugIn::PlugInExtension>();
+    std::unique_ptr<aap::ara::PlugIn> ara;
     std::recursive_mutex model_mutex;
     bool released = false;
     bool reverse_updates_supported = false;
@@ -119,12 +127,12 @@ struct SamplePluginContext {
     std::vector<int64_t> selected_regions, selected_sequences;
     bool selection_has_time_range{};
     double selection_start{}, selection_duration{};
-    std::map<aap_ara_document_id_t, NamedEntity> documents;
-    std::map<aap_ara_musical_context_id_t, MusicalContextEntity> musical_contexts;
-    std::map<aap_ara_region_sequence_id_t, RegionSequenceEntity> region_sequences;
-    std::map<aap_ara_audio_source_id_t, AudioSourceEntity> audio_sources;
-    std::map<aap_ara_audio_modification_id_t, AudioModificationEntity> audio_modifications;
-    std::map<aap_ara_playback_region_id_t, PlaybackRegionEntity> playback_regions;
+    std::map<int64_t, NamedEntity> documents;
+    std::map<int64_t, MusicalContextEntity> musical_contexts;
+    std::map<int64_t, RegionSequenceEntity> region_sequences;
+    std::map<int64_t, AudioSourceEntity> audio_sources;
+    std::map<int64_t, AudioModificationEntity> audio_modifications;
+    std::map<int64_t, PlaybackRegionEntity> playback_regions;
 
     explicit SamplePluginContext(AndroidAudioPluginHost* host_, const char* id) : host(*host_), plugin_id(id ? id : "") {}
 };
@@ -210,458 +218,173 @@ static void publish_model(SamplePluginContext* context, bool contentChanged = tr
     snapshot.json = out.str();
 }
 
-static std::string copy_nullable_string(const char* value) {
-    return value ? value : "";
-}
 
-static aap_ara_host_extension_t* ensure_host_extension(SamplePluginContext* context) {
-    return context && context->host.get_extension
-        ? static_cast<aap_ara_host_extension_t*>(context->host.get_extension(&context->host, AAP_ARA_EXTENSION_URI))
-        : nullptr;
-}
-
-static float compute_rms(const float* samples, int64_t sample_count) {
-    if (!samples || sample_count <= 0)
-        return 0.0f;
-    double sum = 0.0;
-    for (int64_t i = 0; i < sample_count; ++i)
-        sum += static_cast<double>(samples[i]) * static_cast<double>(samples[i]);
-    return static_cast<float>(std::sqrt(sum / static_cast<double>(sample_count)));
-}
-
-static float compute_peak(const float* samples, int64_t sample_count) {
-    float peak = 0.0f;
-    if (!samples || sample_count <= 0)
-        return peak;
-    for (int64_t i = 0; i < sample_count; ++i)
-        peak = std::max(peak, std::fabs(samples[i]));
-    return peak;
-}
-
-static void analyze_audio_range(
-        SamplePluginContext* context,
-        aap_ara_audio_source_id_t audio_source_id,
-        aap_ara_sample_position_t start_sample,
-        aap_ara_sample_count_t sample_count,
-        std::array<float, 4>& out_left,
-        std::array<float, 4>& out_right,
-        const char* label) {
-    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                 "analyze_audio_range begin label=%s audioSourceId=%d start=%d count=%d",
-                 label ? label : "(null)", audio_source_id, start_sample, sample_count);
-    auto* host_ext = ensure_host_extension(context);
-    if (!host_ext)
-        throw std::runtime_error("ARA host extension was not available");
-
-    aap_ara_host_capability_t capability{};
-    capability.struct_size = sizeof(capability);
-    host_ext->get_host_capability(host_ext, &context->host, &capability);
-    context->reverse_updates_supported = capability.struct_size >= sizeof(capability) &&
-        (capability.supported_model_updates & AAP_ARA_HOST_SUPPORTS_CONTENT_UPDATES);
-    context->host_supports_float32 = (capability.supported_sample_formats & AAP_ARA_SAMPLE_FORMAT_FLOAT32) != 0;
-    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                 "host capability api=%u roles=%u formats=%u updates=%u size=%u supportsFloat32=%d",
-                 capability.api_generations,
-                 capability.role_flags,
-                 capability.supported_sample_formats,
-                 capability.supported_model_updates, capability.struct_size,
-                 context->host_supports_float32 ? 1 : 0);
-    if (!context->host_supports_float32)
-        throw std::runtime_error("Host does not advertise float32 sample reads");
-
-    aap_ara_audio_source_sample_range_t range{
-        sizeof(aap_ara_audio_source_sample_range_t),
-        start_sample,
-        sample_count,
-        2,
-        AAP_ARA_SAMPLE_FORMAT_FLOAT32
-    };
-    aap_ara_audio_source_samples_buffer_t destination{
-        sizeof(aap_ara_audio_source_samples_buffer_t),
-        nullptr,
-        0,
-        0,
-        0,
-        0
-    };
-    host_ext->read_audio_source_samples(host_ext, &context->host, audio_source_id, &range, &destination);
-    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                 "read_audio_source_samples returned format=%u channels=%d samples=%d size=%zu",
-                 destination.sample_format, destination.channel_count, destination.sample_count, destination.data_size);
-
-    if (destination.sample_format != AAP_ARA_SAMPLE_FORMAT_FLOAT32)
-        throw std::runtime_error("Host returned unexpected sample format");
-    if (destination.channel_count < 2)
-        throw std::runtime_error("Host returned fewer than 2 channels");
-    if (!destination.data || destination.sample_count < 2 ||
-        destination.data_size < static_cast<size_t>(destination.sample_count) * 2 * sizeof(float))
-        throw std::runtime_error("Host returned an incomplete stereo sample buffer");
-
-    auto* base = static_cast<const float*>(destination.data);
-    auto frames = destination.sample_count;
-    auto* left = base;
-    auto* right = base + frames;
-
-    out_left = {left[0], left[1], compute_rms(left, frames), compute_peak(left, frames)};
-    out_right = {right[0], right[1], compute_rms(right, frames), compute_peak(right, frames)};
-    context->audio_sources[audio_source_id].rms = out_left[2];
-    context->analyzed_source = audio_source_id;
-    context->diagnostic_gain.store(1.0);
-    for (const auto& entry : context->audio_modifications)
-        if (entry.second.audio_source_id == audio_source_id) { context->diagnostic_gain.store(entry.second.gain); break; }
-
-    std::ostringstream ss;
-    ss << label << " range[" << start_sample << ", " << (start_sample + sample_count)
-       << ") left=(" << out_left[0] << ", " << out_left[1] << ", rms=" << out_left[2]
-       << ", peak=" << out_left[3] << ") right=(" << out_right[0] << ", " << out_right[1]
-       << ", rms=" << out_right[2] << ", peak=" << out_right[3] << ")";
-    auto summary = ss.str();
-    {
-        std::lock_guard<std::mutex> lock(context->analysis_mutex);
-        context->analysis_summary = summary;
-    }
-    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG, "analyze_audio_range end summary=%s", summary.c_str());
-}
-
-static void run_analysis(
-        SamplePluginContext* context,
-        aap_ara_audio_source_id_t audioSourceId,
-        bool postChange) {
-    try {
-        std::array<float, 4> left{};
-        std::array<float, 4> right{};
-        if (postChange) {
-            analyze_audio_range(
-                    context, audioSourceId, 64, 128, left, right, "post-change");
-            std::lock_guard<std::mutex> analysisLock(context->analysis_mutex);
-            context->post_change_output_l = left;
-            context->post_change_output_r = right;
-        } else {
-            analyze_audio_range(
-                    context, audioSourceId, 64, 128, left, right, "pre-change");
-            std::lock_guard<std::mutex> analysisLock(context->analysis_mutex);
-            context->pre_change_output_l = left;
-            context->pre_change_output_r = right;
-        }
-    } catch (const std::exception& ex) {
-        std::lock_guard<std::mutex> analysisLock(context->analysis_mutex);
-        context->analysis_summary = ex.what();
-        aap::a_log_f(AAP_LOG_LEVEL_ERROR, LOG_TAG, "run_analysis failed: %s", ex.what());
-    }
-}
-
-static void fill_named_entity(NamedEntity& entity, const char* name, const char* persistentId) {
-    entity.name = copy_nullable_string(name);
-    entity.persistent_id = copy_nullable_string(persistentId);
-}
-
-static void sample_get_factory_capability(aap_ara_extension_t*, AndroidAudioPlugin*, aap_ara_factory_capability_t* destination) {
-    if (!destination)
-        return;
-    if (destination->struct_size >= sizeof(*destination))
-        destination->supported_features = AAP_ARA_FEATURE_MODIFICATION_ARCHIVE | AAP_ARA_FEATURE_VIEW_SELECTION;
-    destination->struct_size = sizeof(aap_ara_factory_capability_t);
-    destination->api_generations = AAP_ARA_API_GENERATION_2;
-    destination->role_flags = AAP_ARA_ROLE_PLAYBACK_RENDERER | AAP_ARA_ROLE_EDITOR_RENDERER | AAP_ARA_ROLE_EDITOR_VIEW;
-    destination->supported_playback_transformation_flags = AAP_ARA_PLAYBACK_TRANSFORMATION_FLAG_NONE;
-}
-
-static void sample_begin_model_update(aap_ara_extension_t*, AndroidAudioPlugin* plugin, uint32_t flags) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto* context = get_context(plugin);
-    context->model_update_active = true;
-    context->last_model_update_flags = flags;
-}
-
-static void sample_end_model_update(aap_ara_extension_t*, AndroidAudioPlugin* plugin) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto* context = get_context(plugin);
-    context->model_update_active = false;
-    publish_model(context);
-}
-
-static void sample_create_document(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_document_id_t documentId, const aap_ara_document_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& document = get_context(plugin)->documents[documentId];
-    fill_named_entity(document, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-}
-
-static void sample_update_document_properties(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_document_id_t documentId, const aap_ara_document_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& document = get_context(plugin)->documents[documentId];
-    fill_named_entity(document, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-}
-
-static void sample_destroy_document(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_document_id_t documentId) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    get_context(plugin)->documents.erase(documentId);
-}
-
-static void sample_create_musical_context(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_document_id_t, aap_ara_musical_context_id_t musicalContextId, const aap_ara_musical_context_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& context = get_context(plugin)->musical_contexts[musicalContextId];
-    fill_named_entity(context, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-    context.has_color = properties && properties->color;
-    if (context.has_color)
-        context.color = *properties->color;
-}
-
-static void sample_update_musical_context_properties(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_musical_context_id_t musicalContextId, const aap_ara_musical_context_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& context = get_context(plugin)->musical_contexts[musicalContextId];
-    fill_named_entity(context, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-    context.has_color = properties && properties->color;
-    if (context.has_color)
-        context.color = *properties->color;
-}
-
-static void sample_destroy_musical_context(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_musical_context_id_t musicalContextId) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    get_context(plugin)->musical_contexts.erase(musicalContextId);
-}
-
-static void sample_create_region_sequence(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_document_id_t, aap_ara_region_sequence_id_t regionSequenceId, const aap_ara_region_sequence_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& sequence = get_context(plugin)->region_sequences[regionSequenceId];
-    fill_named_entity(sequence, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-    sequence.order_index = properties ? properties->order_index : 0;
-    sequence.musical_context_id = properties ? properties->musical_context_id : 0;
-    sequence.has_color = properties && properties->color;
-    if (sequence.has_color)
-        sequence.color = *properties->color;
-}
-
-static void sample_update_region_sequence_properties(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_region_sequence_id_t regionSequenceId, const aap_ara_region_sequence_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& sequence = get_context(plugin)->region_sequences[regionSequenceId];
-    fill_named_entity(sequence, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-    sequence.order_index = properties ? properties->order_index : 0;
-    sequence.musical_context_id = properties ? properties->musical_context_id : 0;
-    sequence.has_color = properties && properties->color;
-    if (sequence.has_color)
-        sequence.color = *properties->color;
-}
-
-static void sample_destroy_region_sequence(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_region_sequence_id_t regionSequenceId) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    get_context(plugin)->region_sequences.erase(regionSequenceId);
-}
-
-static void sample_create_audio_source(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_document_id_t, aap_ara_audio_source_id_t audioSourceId, const aap_ara_audio_source_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& source = get_context(plugin)->audio_sources[audioSourceId];
-    fill_named_entity(source, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-    source.sample_count = properties ? properties->sample_count : 0;
-    source.sample_rate = properties ? properties->sample_rate : 0.0;
-    source.channel_count = properties ? properties->channel_count : 0;
-    source.merits_64_bit_samples = properties && properties->merits_64_bit_samples;
-    source.channel_layout_tag = properties ? copy_nullable_string(properties->channel_layout_tag) : "";
-}
-
-static void sample_update_audio_source_properties(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_source_id_t audioSourceId, const aap_ara_audio_source_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& source = get_context(plugin)->audio_sources[audioSourceId];
-    fill_named_entity(source, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-    source.sample_count = properties ? properties->sample_count : 0;
-    source.sample_rate = properties ? properties->sample_rate : 0.0;
-    source.channel_count = properties ? properties->channel_count : 0;
-    source.merits_64_bit_samples = properties && properties->merits_64_bit_samples;
-    source.channel_layout_tag = properties ? copy_nullable_string(properties->channel_layout_tag) : "";
-}
-
-static void sample_enable_audio_source_samples_access(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_source_id_t audioSourceId, bool enable) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto* context = get_context(plugin);
-    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                 "enable_audio_source_samples_access audioSourceId=%d enable=%d",
-                 audioSourceId, enable ? 1 : 0);
-    context->audio_sources[audioSourceId].samples_access_enabled = enable;
-    context->sample_access_enabled = enable;
-    if (enable)
-        run_analysis(context, audioSourceId, false);
-    if (!context->model_update_active) publish_model(context);
-}
-
-static void sample_notify_audio_source_content_changed(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_source_id_t audioSourceId, aap_ara_sample_position_t startSample, aap_ara_sample_count_t sampleCount) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto* context = get_context(plugin);
-    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                 "notify_audio_source_content_changed audioSourceId=%d start=%d count=%d sampleAccess=%d",
-                 audioSourceId, startSample, sampleCount, context->sample_access_enabled ? 1 : 0);
-    auto& source = context->audio_sources[audioSourceId];
-    ++context->content_changes;
-    source.changed_start_sample = startSample;
-    source.changed_sample_count = sampleCount;
-    if (source.samples_access_enabled)
-        run_analysis(context, audioSourceId, true);
-    if (!context->model_update_active) publish_model(context);
-}
-
-static void sample_destroy_audio_source(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_source_id_t audioSourceId) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    get_context(plugin)->audio_sources.erase(audioSourceId);
-}
-
-static void sample_create_audio_modification(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_source_id_t audioSourceId, aap_ara_audio_modification_id_t audioModificationId, const aap_ara_audio_modification_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& modification = get_context(plugin)->audio_modifications[audioModificationId];
-    fill_named_entity(modification, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-    modification.audio_source_id = audioSourceId;
-}
-
-static void sample_update_audio_modification_properties(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_modification_id_t audioModificationId, const aap_ara_audio_modification_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& modification = get_context(plugin)->audio_modifications[audioModificationId];
-    fill_named_entity(modification, properties ? properties->name : nullptr, properties ? properties->persistent_id : nullptr);
-}
-
-static void sample_destroy_audio_modification(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_modification_id_t audioModificationId) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    get_context(plugin)->audio_modifications.erase(audioModificationId);
-}
-
-static void sample_create_playback_region(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_audio_modification_id_t audioModificationId, aap_ara_playback_region_id_t playbackRegionId, const aap_ara_playback_region_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& playback = get_context(plugin)->playback_regions[playbackRegionId];
-    playback.audio_modification_id = audioModificationId;
-    playback.transformation_flags = properties ? properties->transformation_flags : 0;
-    playback.start_in_modification_time = properties ? properties->start_in_modification_time : 0.0;
-    playback.duration_in_modification_time = properties ? properties->duration_in_modification_time : 0.0;
-    playback.start_in_playback_time = properties ? properties->start_in_playback_time : 0.0;
-    playback.duration_in_playback_time = properties ? properties->duration_in_playback_time : 0.0;
-    playback.region_sequence_id = properties ? properties->region_sequence_id : 0;
-    playback.name = properties ? copy_nullable_string(properties->name) : "";
-    playback.has_color = properties && properties->color;
-    if (playback.has_color)
-        playback.color = *properties->color;
-}
-
-static void sample_update_playback_region_properties(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_playback_region_id_t playbackRegionId, const aap_ara_playback_region_properties_t* properties) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    auto& playback = get_context(plugin)->playback_regions[playbackRegionId];
-    playback.transformation_flags = properties ? properties->transformation_flags : 0;
-    playback.start_in_modification_time = properties ? properties->start_in_modification_time : 0.0;
-    playback.duration_in_modification_time = properties ? properties->duration_in_modification_time : 0.0;
-    playback.start_in_playback_time = properties ? properties->start_in_playback_time : 0.0;
-    playback.duration_in_playback_time = properties ? properties->duration_in_playback_time : 0.0;
-    playback.region_sequence_id = properties ? properties->region_sequence_id : 0;
-    playback.name = properties ? copy_nullable_string(properties->name) : "";
-    playback.has_color = properties && properties->color;
-    if (playback.has_color)
-        playback.color = *properties->color;
-}
-
-static void sample_destroy_playback_region(aap_ara_extension_t*, AndroidAudioPlugin* plugin, aap_ara_playback_region_id_t playbackRegionId) {
-    const std::lock_guard<std::recursive_mutex> model_lock(get_context(plugin)->model_mutex);
-    get_context(plugin)->playback_regions.erase(playbackRegionId);
-}
-
-static bool sample_store_modification_state(aap_ara_extension_t*, AndroidAudioPlugin* plugin, int64_t id, aap_ara_archive_buffer_t* destination) {
-    auto* context = get_context(plugin);
-    const std::lock_guard<std::recursive_mutex> lock(context->model_mutex);
-    auto found = context->audio_modifications.find(id);
-    if (found == context->audio_modifications.end() || !destination) return false;
-    std::ostringstream out;
-    out.precision(17); out << "gain-v1:" << found->second.gain;
-    auto state = out.str();
-    destination->data_size = state.size();
-    if (!destination->data || destination->capacity < state.size()) return false;
-    memcpy(destination->data, state.data(), state.size());
-    return true;
-}
-
-static bool sample_restore_modification_state(aap_ara_extension_t*, AndroidAudioPlugin* plugin, int64_t id, const void* data, size_t size) {
-    auto* context = get_context(plugin);
-    const std::lock_guard<std::recursive_mutex> lock(context->model_mutex);
-    auto found = context->audio_modifications.find(id);
-    if (found == context->audio_modifications.end() || size > AAP_ARA_MAX_ARCHIVE_BYTES || (!data && size)) return false;
-    double gain = 1.0;
-    if (size) {
-        std::string state(static_cast<const char*>(data), size);
-        if (state.compare(0, 8, "gain-v1:") != 0) return false;
-        char* end{};
-        gain = std::strtod(state.c_str() + 8, &end);
-        if (end == state.c_str() + 8 || end != state.c_str() + size || !std::isfinite(gain) || gain < 0 || gain > 2) return false;
-    }
-    found->second.gain = gain;
-    if (context->analyzed_source == found->second.audio_source_id) context->diagnostic_gain.store(gain);
-    // Host restore (load/undo/redo) must never echo a reverse notification.
-    if (!context->model_update_active) publish_model(context);
-    return true;
-}
-
-static bool sample_notify_selection(aap_ara_extension_t*, AndroidAudioPlugin* plugin, const aap_ara_view_selection_t* selection) {
-    auto* context = get_context(plugin);
-    const std::lock_guard<std::recursive_mutex> lock(context->model_mutex);
-    if (!selection || selection->struct_size < sizeof(*selection) || context->model_update_active ||
-        !context->documents.count(selection->document_id) ||
-        (selection->playback_region_count && !selection->playback_region_ids) ||
-        (selection->region_sequence_count && !selection->region_sequence_ids) ||
-        (selection->has_time_range && (!std::isfinite(selection->start) || !std::isfinite(selection->duration) ||
-            selection->duration < 0 || !std::isfinite(selection->start + selection->duration))))
-        return false;
-    std::vector<int64_t> regions, sequences;
-    std::set<int64_t> seen_regions, seen_sequences;
-    for (uint32_t i = 0; i < selection->playback_region_count; ++i) {
-        const auto id = selection->playback_region_ids[i];
-        if (!context->playback_regions.count(id))
-            return false;
-        if (seen_regions.insert(id).second)
-            regions.push_back(id);
-    }
-    for (uint32_t i = 0; i < selection->region_sequence_count; ++i) {
-        const auto id = selection->region_sequence_ids[i];
-        if (!context->region_sequences.count(id))
-            return false;
-        if (seen_sequences.insert(id).second)
-            sequences.push_back(id);
-    }
-    if (context->selected_regions == regions && context->selected_sequences == sequences &&
-        context->selection_document_id == selection->document_id &&
-        context->selection_has_time_range == selection->has_time_range &&
-        (!selection->has_time_range || (context->selection_start == selection->start && context->selection_duration == selection->duration)))
-        return true;
-    context->selected_regions = std::move(regions);
-    context->selected_sequences = std::move(sequences);
-    context->selection_document_id = selection->document_id;
-    context->selection_has_time_range = selection->has_time_range;
-    context->selection_start = selection->has_time_range ? selection->start : 0;
-    context->selection_duration = selection->has_time_range ? selection->duration : 0;
-    ++context->selection_changes;
-    publish_model(context, false);
-    return true;
-}
-
-static aap_ara_extension_t sample_ara_extension{
-        nullptr,
-        sample_get_factory_capability,
-        sample_begin_model_update,
-        sample_end_model_update,
-        sample_create_document,
-        sample_update_document_properties,
-        sample_destroy_document,
-        sample_create_musical_context,
-        sample_update_musical_context_properties,
-        sample_destroy_musical_context,
-        sample_create_region_sequence,
-        sample_update_region_sequence_properties,
-        sample_destroy_region_sequence,
-        sample_create_audio_source,
-        sample_update_audio_source_properties,
-        sample_enable_audio_source_samples_access,
-        sample_notify_audio_source_content_changed,
-        sample_destroy_audio_source,
-        sample_create_audio_modification,
-        sample_update_audio_modification_properties,
-        sample_destroy_audio_modification,
-        sample_create_playback_region,
-        sample_update_playback_region_properties,
-        sample_destroy_playback_region,
-        sample_store_modification_state,
-        sample_restore_modification_state,
-        sample_notify_selection
+struct SampleSource : AudioSource {
+    using AudioSource::AudioSource;
+    double rms{};
+    ARASamplePosition changedStart{};
+    ARASampleCount changedCount{};
 };
-
+struct SampleModification : AudioModification {
+    double gain = 1.0;
+    SampleModification(AudioSource* source, ARAAudioModificationHostRef host, const AudioModification* clone) noexcept
+        : AudioModification(source, host, clone), gain(clone ? static_cast<const SampleModification*>(clone)->gain : 1.0) {}
+};
+class SampleView;
+class SampleDocumentController : public DocumentController {
+public:
+    std::weak_ptr<SamplePluginContext> companion;
+    explicit SampleDocumentController(const PlugInEntry* entry, const ARADocumentControllerHostInstance* host) noexcept : DocumentController(entry, host) {}
+    void sync(bool changed = true) noexcept {
+        auto c = companion.lock(); if (!c) return;
+        c->documents.clear(); c->region_sequences.clear(); c->audio_sources.clear(); c->audio_modifications.clear(); c->playback_regions.clear();
+        auto* document = getDocument();
+        if (document) {
+            c->documents[1].name = text(document->getName());
+            for (auto* track : document->getRegionSequences()) {
+                auto& t = c->region_sequences[hostID(track->getHostRef())]; t.name = text(track->getName()); t.order_index = track->getOrderIndex();
+                for (auto* region : track->getPlaybackRegions()) {
+                    auto& r = c->playback_regions[hostID(region->getHostRef())]; r.name = text(region->getName());
+                    r.region_sequence_id = hostID(track->getHostRef()); r.audio_modification_id = hostID(region->getAudioModification()->getHostRef());
+                    r.start_in_modification_time = region->getStartInAudioModificationTime(); r.duration_in_modification_time = region->getDurationInAudioModificationTime();
+                    r.start_in_playback_time = region->getStartInPlaybackTime(); r.duration_in_playback_time = region->getDurationInPlaybackTime();
+                }
+            }
+            for (auto* source : document->getAudioSources<SampleSource>()) {
+                auto& v = c->audio_sources[hostID(source->getHostRef())]; v.name = text(source->getName()); v.rms = source->rms;
+                v.sample_count = source->getSampleCount(); v.sample_rate = source->getSampleRate(); v.channel_count = source->getChannelCount();
+                v.samples_access_enabled = source->isSampleAccessEnabled(); v.changed_start_sample = source->changedStart; v.changed_sample_count = source->changedCount;
+                for (auto* modification : source->getAudioModifications<SampleModification>()) {
+                    auto& m = c->audio_modifications[hostID(modification->getHostRef())]; m.name = text(modification->getName());
+                    m.audio_source_id = hostID(source->getHostRef()); m.gain = modification->gain;
+                    if (c->analyzed_source == m.audio_source_id) c->diagnostic_gain.store(m.gain);
+                }
+            }
+        }
+        c->reverse_updates_supported = getHostModelUpdateController() != nullptr;
+        publish_model(c.get(), changed);
+    }
+    static const char* text(const OptionalProperty<ARAUtf8String>& value) { return value ? static_cast<const char*>(value) : ""; }
+    bool setGain(int64_t id, double gain) {
+        if (!getDocument()) return false;
+        for (auto* source : getDocument()->getAudioSources()) for (auto* m : source->getAudioModifications<SampleModification>()) {
+            if (hostID(m->getHostRef()) != id) continue;
+            if (m->gain == gain) return true;
+            m->gain = gain;
+            // The SDK queues this until the host calls notifyModelUpdates().
+            notifyAudioModificationContentChanged(m, ContentUpdateScopes(kARAContentUpdateEverythingChanged));
+            if (auto c = companion.lock()) ++c->content_changes;
+            sync(); return true;
+        }
+        return false;
+    }
+protected:
+    void willBeginEditing() noexcept override { if (auto c = companion.lock()) c->model_update_active = true; }
+    void didEndEditing() noexcept override { if (auto c = companion.lock()) c->model_update_active = false; sync(); }
+    void willDestroyDocument(Document*) noexcept override {
+        if (auto c = companion.lock()) { c->documents.clear(); c->region_sequences.clear(); c->audio_sources.clear(); c->audio_modifications.clear(); c->playback_regions.clear(); publish_model(c.get()); }
+    }
+    AudioSource* doCreateAudioSource(Document* doc, ARAAudioSourceHostRef host) noexcept override { return new SampleSource(doc, host); }
+    AudioModification* doCreateAudioModification(AudioSource* source, ARAAudioModificationHostRef host, const AudioModification* clone) noexcept override { return new SampleModification(source, host, clone); }
+    void doUpdateMusicalContextContent(MusicalContext*, const ARAContentTimeRange*, ContentUpdateScopes) noexcept override {}
+    void doUpdateAudioSourceContent(AudioSource* source, const ARAContentTimeRange* range, ContentUpdateScopes) noexcept override {
+        auto* s = static_cast<SampleSource*>(source);
+        s->changedStart = range ? std::llround(range->start * s->getSampleRate()) : 0;
+        s->changedCount = range ? std::llround(range->duration * s->getSampleRate()) : s->getSampleCount();
+        if (auto c = companion.lock()) ++c->content_changes;
+        if (s->isSampleAccessEnabled()) analyze(s, true);
+    }
+    void willEnableAudioSourceSamplesAccess(AudioSource*, bool) noexcept override {}
+    void didEnableAudioSourceSamplesAccess(AudioSource* source, bool enabled) noexcept override { if (enabled) analyze(static_cast<SampleSource*>(source), false); sync(); }
+    bool doStoreObjectsToArchive(HostArchiveWriter* writer, const StoreObjectsFilter* filter) noexcept override {
+        std::ostringstream out; out.precision(17); out << "ARAAAP-gain-v2\n";
+        for (auto* m : filter->getAudioModificationsToStore<SampleModification>()) out << m->getPersistentID() << '\t' << m->gain << '\n';
+        auto bytes = out.str(); return writer->writeBytesToArchive(0, bytes.size(), reinterpret_cast<const ARAByte*>(bytes.data()));
+    }
+    bool doRestoreObjectsFromArchive(HostArchiveReader* reader, const RestoreObjectsFilter* filter) noexcept override {
+        auto size = reader->getArchiveSize();
+        if (!size) { // The sample's empty archive means default gain for the selected modification(s).
+            for (auto* source : getDocument()->getAudioSources()) for (auto* m : source->getAudioModifications<SampleModification>())
+                if (filter->getAudioModificationToRestoreStateWithID(m->getPersistentID().c_str())) m->gain = 1.0;
+            sync(); return true;
+        }
+        std::string bytes(size, '\0'); if (!reader->readBytesFromArchive(0, size, reinterpret_cast<ARAByte*>(bytes.data()))) return false;
+        // Projects saved before the SDK migration contain one opaque gain value,
+        // without an SDK archive envelope or persistent ID. Import it through the
+        // SDK's restore filter so the host's arrangement and saved edit both load.
+        if (bytes.compare(0, 8, "gain-v1:") == 0) {
+            char* end{};
+            const char* start = bytes.c_str() + 8;
+            const auto gain = std::strtod(start, &end);
+            if (end == start || end != bytes.c_str() + bytes.size() || !std::isfinite(gain) || gain < 0 || gain > 2)
+                return false;
+            for (auto* source : getDocument()->getAudioSources())
+                for (auto* m : source->getAudioModifications<SampleModification>())
+                    if (filter->getAudioModificationToRestoreStateWithID(m->getPersistentID().c_str())) m->gain = gain;
+            sync(); return true;
+        }
+        std::istringstream in(bytes); std::string header, line; std::getline(in, header); if (header != "ARAAAP-gain-v2") return false;
+        std::vector<std::pair<SampleModification*, double>> changes;
+        while (std::getline(in, line)) {
+            auto tab = line.find('\t'); if (tab == std::string::npos) return false;
+            char* end{}; auto gain = std::strtod(line.c_str() + tab + 1, &end);
+            if (end != line.c_str() + line.size() || !std::isfinite(gain) || gain < 0 || gain > 2) return false;
+            auto* m = filter->getAudioModificationToRestoreStateWithID<SampleModification>(line.substr(0, tab).c_str());
+            if (m) changes.emplace_back(m, gain);
+        }
+        for (auto& entry : changes) entry.first->gain = entry.second;
+        sync(); return true;
+    }
+    EditorView* doCreateEditorView() noexcept override;
+private:
+    void analyze(SampleSource* source, bool post) noexcept {
+        auto c = companion.lock(); if (!c) return;
+        std::array<float, 128> left{}, right{}; void* buffers[]{left.data(), right.data()};
+        HostAudioReader reader(source);
+        if (!reader.readAudioSamples(64, 128, buffers)) { std::lock_guard<std::mutex> lock(c->analysis_mutex); c->analysis_summary = "SDK audio reader failed"; return; }
+        auto metrics = [](const auto& samples) { double sum = 0; float peak = 0; for (float v : samples) { sum += double(v) * v; peak = std::max(peak, std::fabs(v)); } return std::array<float, 4>{samples[0], samples[1], float(std::sqrt(sum / samples.size())), peak}; };
+        auto l = metrics(left), r = metrics(right); source->rms = l[2]; c->analyzed_source = hostID(source->getHostRef());
+        std::lock_guard<std::mutex> lock(c->analysis_mutex);
+        if (post) { c->post_change_output_l = l; c->post_change_output_r = r; } else { c->pre_change_output_l = l; c->pre_change_output_r = r; }
+        c->analysis_summary = std::string("ARA SDK ") + (post ? "post-change" : "pre-change") + " sample read";
+    }
+};
+class SampleView : public EditorView {
+public:
+    using EditorView::EditorView;
+protected:
+    void doNotifySelection(const ViewSelection* selection) noexcept override {
+        auto* dc = getDocumentController<SampleDocumentController>(); auto c = dc->companion.lock(); if (!c) return;
+        c->selected_regions.clear(); c->selected_sequences.clear();
+        for (auto* r : selection->getPlaybackRegions()) c->selected_regions.push_back(hostID(r->getHostRef()));
+        for (auto* s : selection->getRegionSequences()) c->selected_sequences.push_back(hostID(s->getHostRef()));
+        const ARAContentTimeRange* range = selection->getTimeRange(); c->selection_has_time_range = range != nullptr;
+        c->selection_start = range ? range->start : 0; c->selection_duration = range ? range->duration : 0;
+        c->selection_document_id = 1; ++c->selection_changes; dc->sync(false);
+    }
+};
+EditorView* SampleDocumentController::doCreateEditorView() noexcept { return new SampleView(this); }
+class SampleFactoryConfig : public FactoryConfig {
+public:
+    ARAAPIGeneration getLowestSupportedApiGeneration() const noexcept override { return kARAAPIGeneration_2_0_Final; }
+    ARAAPIGeneration getHighestSupportedApiGeneration() const noexcept override { return kARAAPIGeneration_2_3_Final; }
+    const char* getFactoryID() const noexcept override { return "org.androidaudioplugin.ara.sample.factory"; }
+    const char* getPlugInName() const noexcept override { return "AAP ARA SDK Sample"; }
+    const char* getManufacturerName() const noexcept override { return "AAP"; }
+    const char* getInformationURL() const noexcept override { return "https://github.com/atsushieno/aap-ara"; }
+    const char* getVersion() const noexcept override { return "0.1.0"; }
+    const char* getDocumentArchiveID() const noexcept override { return "org.androidaudioplugin.ara.sample.archive/2"; }
+};
+static ARAAAPPlugInExtension sdkExtension{
+    [](AndroidAudioPlugin*) -> const ARAFactory* { return PlugInEntry::getPlugInEntry<SampleFactoryConfig, SampleDocumentController>()->getFactory(); },
+    [](AndroidAudioPlugin* plugin, ARADocumentControllerRef ref, ARAPlugInInstanceRoleFlags known, ARAPlugInInstanceRoleFlags assigned) {
+        auto context = *static_cast<std::shared_ptr<SamplePluginContext>*>(plugin->plugin_specific);
+        auto* result = context->binding->bindToARA(ref, known, assigned);
+        auto* dc = context->binding->getDocumentController<SampleDocumentController>(); dc->companion = context;
+        if (auto* view = context->binding->getEditorView()) view->setEditorOpen(true);
+        dc->sync(false); return result;
+    }
+};
 static void sample_prepare(AndroidAudioPlugin* plugin, int32_t, aap_buffer_t*) {
     auto* context = get_context(plugin);
     auto* info_extension = context->host.get_extension
@@ -705,10 +428,8 @@ static void sample_process(AndroidAudioPlugin* plugin, aap_buffer_t* buffer, int
     }
 }
 
-static void* sample_get_extension(AndroidAudioPlugin*, const char* uri) {
-    if (uri && strcmp(uri, AAP_ARA_EXTENSION_URI) == 0)
-        return &sample_ara_extension;
-    return nullptr;
+static void* sample_get_extension(AndroidAudioPlugin* plugin, const char* uri) {
+    return get_context(plugin)->ara->getExtension(uri);
 }
 
 static AndroidAudioPlugin* sample_instantiate(AndroidAudioPluginFactory*, const char* pluginId, AndroidAudioPluginHost* host) {
@@ -728,6 +449,7 @@ static AndroidAudioPlugin* sample_instantiate(AndroidAudioPluginFactory*, const 
     plugin->deactivate = sample_deactivate;
     plugin->get_extension = sample_get_extension;
     plugin->get_plugin_info = nullptr;
+    context->ara = std::make_unique<aap::ara::PlugIn>(plugin, &context->host, &sdkExtension);
     return plugin;
 }
 
@@ -744,6 +466,9 @@ static void sample_release(AndroidAudioPluginFactory*, AndroidAudioPlugin* insta
             plugin_snapshot_tokens.erase(found);
         }
     }
+    context->ara->prepareForRelease();
+    context->ara->synchronize([&] { context->binding.reset(); });
+    context->ara.reset();
     delete static_cast<std::shared_ptr<SamplePluginContext>*>(instance->plugin_specific);
     delete instance;
 }
@@ -754,11 +479,10 @@ static AndroidAudioPluginFactory factory{
         nullptr
 };
 
-AndroidAudioPluginFactory* GetAndroidAudioPluginFactory() {
+extern "C" AndroidAudioPluginFactory* GetAndroidAudioPluginFactory() {
     return &factory;
 }
 
-}
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_resolveSnapshot(
@@ -789,29 +513,15 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_setModificationGain(
         JNIEnv* env, jobject, jlong token, jlong id, jdouble gain) {
     std::shared_ptr<SamplePluginContext> context;
-    {
-        const std::lock_guard<std::mutex> lock(snapshots_mutex);
-        auto found = editable_contexts.find(token);
-        if (found == editable_contexts.end()) return env->NewStringUTF("The host has released this instance.");
-        context = found->second;
-    }
-    const std::lock_guard<std::recursive_mutex> lock(context->model_mutex);
-    if (context->released) return env->NewStringUTF("The host has released this instance.");
-    if (context->model_update_active) return env->NewStringUTF("The host is updating the document. Try again.");
-    if (!context->reverse_updates_supported) return env->NewStringUTF("This host does not support plugin content updates.");
-    auto found = context->audio_modifications.find(id);
-    if (found == context->audio_modifications.end() || !std::isfinite(gain) || gain < 0 || gain > 2)
-        return env->NewStringUTF("Invalid modification");
-    if (found->second.gain == gain) return env->NewStringUTF("");
-    auto* host = ensure_host_extension(context.get());
-    if (!host || !host->notify_content_changed) return env->NewStringUTF("Content callback unavailable");
-    found->second.gain = gain;
-    if (context->analyzed_source == found->second.audio_source_id) context->diagnostic_gain.store(gain);
-    ++context->content_changes;
-    publish_model(context.get());
-    aap_ara_content_update_t update{sizeof(update), AAP_ARA_CONTENT_AUDIO_MODIFICATION, id, 0, false, 0, 0};
-    // The receiving host enqueues this notification. It cannot call back into
-    // this model until we return and release the lock.
-    host->notify_content_changed(host, &context->host, &update);
-    return env->NewStringUTF("");
+    { const std::lock_guard<std::mutex> lock(snapshots_mutex); auto found = editable_contexts.find(token); if (found == editable_contexts.end()) return env->NewStringUTF("The host has released this instance."); context = found->second; }
+    const std::lock_guard<std::recursive_mutex> lifetime(context->model_mutex);
+    if (context->released || !context->ara) return env->NewStringUTF("The host has released this instance.");
+    std::string error;
+    context->ara->synchronize([&] {
+        if (context->released) { error = "The host has released this instance."; return; }
+        if (context->model_update_active || !std::isfinite(gain) || gain < 0 || gain > 2) { error = "Invalid modification edit"; return; }
+        auto* dc = context->binding->getDocumentController<SampleDocumentController>();
+        if (!dc || !context->reverse_updates_supported || !dc->setGain(id, gain)) error = "Modification unavailable";
+    });
+    return env->NewStringUTF(error.c_str());
 }

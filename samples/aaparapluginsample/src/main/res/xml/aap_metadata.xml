@@ -13,7 +13,7 @@
       <port direction="output" content="audio" name="Analysis Out R" />
     </ports>
     <extensions>
-      <extension uri="urn://androidaudioplugin.org/extensions/ara/v1" />
+      <extension uri="urn://androidaudioplugin.org/extensions/ara/v2" />
     </extensions>
   </plugin>
 </plugins>

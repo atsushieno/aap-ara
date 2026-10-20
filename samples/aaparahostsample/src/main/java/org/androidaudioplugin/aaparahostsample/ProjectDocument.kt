@@ -58,7 +58,7 @@ class ProjectDocument {
                 require(clips.all { c -> tracks.any { it.id == c.track } &&
                     listOf(c.start, c.offset, c.duration, c.frequency, c.gain).all { it.isFinite() } &&
                     c.start >= 0 && c.offset >= 0 && c.duration > 0 && c.offset + c.duration <= 60 &&
-                    c.frequency in 20.0..20000.0 && c.gain in 0.0..1.0 && c.pluginState.length <= 8192 &&
+                    c.frequency in 20.0..20000.0 && c.gain in 0.0..1.0 && c.pluginState.length <= 64 * 1024 * 1024 &&
                     c.pluginState.length % 2 == 0 && c.pluginState.all { it in '0'..'9' || it in 'a'..'f' } }) { "Invalid clip properties" }
                 nextId = maxOf(json.getInt("nextId"), (ids.maxOrNull() ?: 9) + 1)
                 require(nextId < Int.MAX_VALUE) { "Object identities exhausted" }

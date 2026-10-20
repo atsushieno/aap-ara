@@ -10,8 +10,8 @@
 
 #include "aap/core/host/plugin-host.h"
 #include "aap/core/host/plugin-instance.h"
-#include "aap/ext/ara.h"
-#include "aap/ara/host-runtime.h"
+#include "sample-host-services.h"
+#include "aap/ara/remote-host.h"
 #include "aap/ara/registry.h"
 #include "aap/core/aapxs/ara-aapxs.h"
 #include "aap/unstable/logging.h"
@@ -59,10 +59,10 @@ public:
 }
 
 namespace {
-constexpr aap_ara_sample_count_t kAudioSourceLength = 48000;
-constexpr aap_ara_sample_position_t kAnalysisStart = 64;
-constexpr aap_ara_sample_count_t kAnalysisCount = 128;
-constexpr aap_ara_sample_count_t kContentChangeCount = 2048;
+constexpr ARASampleCount kAudioSourceLength = 48000;
+constexpr ARASamplePosition kAnalysisStart = 64;
+constexpr ARASampleCount kAnalysisCount = 128;
+constexpr ARASampleCount kContentChangeCount = 2048;
 
 std::string jstringToStdString(JNIEnv* env, jstring s) {
     jboolean copy = false;
@@ -106,7 +106,7 @@ struct HostAudioStore {
     }
 };
 
-class DeterministicAudioSourceProvider : public aap::ara::AudioSourceContentProvider {
+class DeterministicAudioSourceProvider : public SampleAudioSource {
     HostAudioStore& store;
     int32_t sample_rate;
 
@@ -115,35 +115,14 @@ public:
             : store(store_), sample_rate(sampleRate) {}
 
     int32_t channelCount() const override { return 2; }
-    aap_ara_sample_rate_t sampleRate() const override { return sample_rate; }
-    aap_ara_sample_count_t sampleCount() const override { return kAudioSourceLength; }
-    uint32_t supportedSampleFormats() const override { return AAP_ARA_SAMPLE_FORMAT_FLOAT32; }
-
-    bool readSamples(
-            const aap_ara_audio_source_sample_range_t& sampleRange,
-            aap_ara_audio_source_samples_buffer_t& destination) override {
-        if (sampleRange.sample_format != AAP_ARA_SAMPLE_FORMAT_FLOAT32)
-            return false;
-        auto frames = std::max<int64_t>(0, std::min<int64_t>(sampleRange.sample_count, kAudioSourceLength - sampleRange.start_sample));
-        auto channels = std::min(2, sampleRange.channel_count);
-        auto bytes_per_channel = static_cast<size_t>(frames) * sizeof(float);
-        auto total_size = bytes_per_channel * static_cast<size_t>(channels);
-        if (!destination.data || destination.data_size < total_size) {
-            destination.data_size = 0;
-            destination.sample_count = 0;
-            return false;
+    ARASampleRate sampleRate() const override { return sample_rate; }
+    ARASampleCount sampleCount() const override { return kAudioSourceLength; }
+    bool readSamples(ARASamplePosition start, ARASampleCount count, void* const buffers[], bool wide) override {
+        if (start < 0 || count < 0 || start > kAudioSourceLength || count > kAudioSourceLength - start) return false;
+        for (int c = 0; c < 2; ++c) {
+            if (wide) for (int64_t i = 0; i < count; ++i) static_cast<double*>(buffers[c])[i] = store.current()[c][start+i];
+            else std::memcpy(buffers[c], store.current()[c].data() + start, count * sizeof(float));
         }
-        auto* base = static_cast<uint8_t*>(destination.data);
-        auto& current = store.current();
-        for (int ch = 0; ch < channels; ++ch) {
-            memcpy(base + bytes_per_channel * static_cast<size_t>(ch),
-                   current[ch].data() + sampleRange.start_sample,
-                   bytes_per_channel);
-        }
-        destination.data_size = total_size;
-        destination.sample_count = frames;
-        destination.channel_count = channels;
-        destination.sample_format = AAP_ARA_SAMPLE_FORMAT_FLOAT32;
         return true;
     }
 };
@@ -168,8 +147,8 @@ static float compute_peak(const float* samples, int64_t sample_count) {
 
 static HostAnalysisMetrics compute_metrics(
         const std::array<std::vector<float>, 2>& planes,
-        aap_ara_sample_position_t start_sample,
-        aap_ara_sample_count_t sample_count) {
+        ARASamplePosition start_sample,
+        ARASampleCount sample_count) {
     auto frames = std::max<int64_t>(0, std::min<int64_t>(sample_count, kAudioSourceLength - start_sample));
     HostAnalysisMetrics metrics{};
     auto* left = planes[0].data() + start_sample;
@@ -181,14 +160,10 @@ static HostAnalysisMetrics compute_metrics(
 
 struct HostScenarioContext {
     HostAudioStore store;
-    aap::ara::HostRuntime runtime;
+    SampleHostServices runtime;
     std::shared_ptr<DeterministicAudioSourceProvider> source_provider;
 
     explicit HostScenarioContext(int32_t sample_rate) : store(sample_rate) {
-        runtime.setCapabilities(
-                AAP_ARA_API_GENERATION_2,
-                AAP_ARA_ROLE_EDITOR_RENDERER,
-                AAP_ARA_SAMPLE_FORMAT_FLOAT32);
         source_provider = std::make_shared<DeterministicAudioSourceProvider>(store, sample_rate);
     }
 };
@@ -239,7 +214,7 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
         auto* registry = aap::xs::AAPXSDefinitionRegistry::getStandardExtensions();
         aap::ara::addToRegistry(*registry);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Registry prepared with standard + ARA extensions");
-        auto* client = new aap::PluginClient(connections, &pluginList, registry);
+        auto client = std::make_unique<aap::PluginClient>(connections, &pluginList, registry);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "PluginClient created");
         // createInstance() no longer takes sampleRate (it is passed to prepare() below).
         auto result = client->createInstance(pluginIdString, true);
@@ -247,14 +222,14 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
                      "createInstance returned instanceId=%d error=%s",
                      result.value, result.error.c_str());
         if (!result.error.empty()) {
-            delete client;
+            client.reset();
             std::string message = "Failed to create plugin instance: " + result.error;
             return env->NewStringUTF(message.c_str());
         }
 
         auto* instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(result.value));
         if (!instance) {
-            delete client;
+            client.reset();
             return env->NewStringUTF("Plugin instance was created but could not be resolved.");
         }
         aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
@@ -266,118 +241,38 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
                 plugin->get_extension(plugin, AAP_ARA_EXTENSION_URI));
         if (!ara) {
             client->destroyInstance(instance);
-            delete client;
+            client.reset();
             return env->NewStringUTF("The plugin did not expose the ARA extension.");
         }
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Resolved plugin ARA extension");
 
-        aap_ara_factory_capability_t capability{};
-        capability.struct_size = sizeof(capability);
-        ara->get_factory_capability(ara, plugin, &capability);
-
-        report << "Plugin: " << pluginIdString << "\n";
-        report << "Factory capability:\n";
-        report << "  api_generations=" << capability.api_generations << "\n";
-        report << "  role_flags=" << capability.role_flags << "\n";
-        report << "  playback_flags=" << capability.supported_playback_transformation_flags << "\n";
-        report << "Host sample source:\n";
-        report << "  analysis_range=[" << kAnalysisStart << ", " << (kAnalysisStart + kAnalysisCount) << ")\n";
-        report << "  content_change=[" << 0 << ", " << kContentChangeCount << ")\n";
-
-        constexpr aap_ara_document_id_t documentId = 1;
-        constexpr aap_ara_musical_context_id_t musicalContextId = 10;
-        constexpr aap_ara_region_sequence_id_t regionSequenceId = 20;
-        constexpr aap_ara_audio_source_id_t audioSourceId = 30;
-        constexpr aap_ara_audio_modification_id_t audioModificationId = 40;
-        constexpr aap_ara_playback_region_id_t playbackRegionId = 50;
-
         HostScenarioContext host_context(sampleRate);
-        host_context.runtime.registerAudioSource(audioSourceId, host_context.source_provider);
-        aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                     "Registered host audio source id=%d", audioSourceId);
-        auto host_bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(host_context.runtime, *instance);
-        aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Installed scoped host ARA extension bridge");
-
-        aap_ara_color_t contextColor{0.2f, 0.6f, 0.9f};
-        aap_ara_color_t regionColor{0.8f, 0.4f, 0.1f};
-        aap_ara_color_t playbackColor{0.1f, 0.8f, 0.3f};
-
-        aap_ara_document_properties_t documentProperties{
-                sizeof(aap_ara_document_properties_t),
-                "Sample Document",
-                "sample-document"
-        };
-        aap_ara_musical_context_properties_t contextProperties{
-                sizeof(aap_ara_musical_context_properties_t),
-                "Song",
-                &contextColor,
-                "song-context"
-        };
-        aap_ara_region_sequence_properties_t sequenceProperties{
-                sizeof(aap_ara_region_sequence_properties_t),
-                "Lead Vox",
-                0,
-                musicalContextId,
-                &regionColor,
-                "lead-vox-sequence"
-        };
-        aap_ara_audio_source_properties_t audioSourceProperties{
-                sizeof(aap_ara_audio_source_properties_t),
-                "Lead Vox Take",
-                "lead-vox-source",
-                kAudioSourceLength,
-                static_cast<double>(sampleRate),
-                2,
-                false,
-                "stereo"
-        };
-        aap_ara_audio_modification_properties_t modificationProperties{
-                sizeof(aap_ara_audio_modification_properties_t),
-                "Lead Vox Edit",
-                "lead-vox-edit"
-        };
-        aap_ara_playback_region_properties_t playbackProperties{
-                sizeof(aap_ara_playback_region_properties_t),
-                AAP_ARA_PLAYBACK_TRANSFORMATION_FLAG_NONE,
-                0.0,
-                1.0,
-                0.0,
-                1.0,
-                regionSequenceId,
-                "Lead Vox Region",
-                &playbackColor
-        };
-
-        report << "\nCreating ARA model...\n";
-        aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Beginning ARA create/update transaction");
-        ara->begin_model_update(ara, plugin, AAP_ARA_MODEL_UPDATE_FLAG_NONE);
-        ara->create_document(ara, plugin, documentId, &documentProperties);
-        ara->create_musical_context(ara, plugin, documentId, musicalContextId, &contextProperties);
-        ara->create_region_sequence(ara, plugin, documentId, regionSequenceId, &sequenceProperties);
-        ara->create_audio_source(ara, plugin, documentId, audioSourceId, &audioSourceProperties);
-        ara->create_audio_modification(ara, plugin, audioSourceId, audioModificationId, &modificationProperties);
-        ara->create_playback_region(ara, plugin, audioModificationId, playbackRegionId, &playbackProperties);
-
-        documentProperties.name = "Sample Document Updated";
-        sequenceProperties.order_index = 1;
-        audioSourceProperties.sample_count = kAudioSourceLength;
-        modificationProperties.name = "Lead Vox Edit Updated";
-        playbackProperties.duration_in_modification_time = 2.0;
-        playbackProperties.duration_in_playback_time = 2.0;
-
-        ara->update_document_properties(ara, plugin, documentId, &documentProperties);
-        ara->update_region_sequence_properties(ara, plugin, regionSequenceId, &sequenceProperties);
-        ara->update_audio_source_properties(ara, plugin, audioSourceId, &audioSourceProperties);
-        ara->update_audio_modification_properties(ara, plugin, audioModificationId, &modificationProperties);
-        ara->update_playback_region_properties(ara, plugin, playbackRegionId, &playbackProperties);
-        ara->end_model_update(ara, plugin);
-        aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Completed ARA create/update transaction");
-        report << "  create/update transaction completed\n";
-
+        host_context.runtime.registerAudioSource(30, host_context.source_provider);
+        ARADocumentProperties documentProperties{sizeof(documentProperties), "Sample Document"};
+        auto sdk = std::make_unique<aap::ara::Host>(plugin, ara, &host_context.runtime.instance, &documentProperties);
+        auto host_bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(sdk->transportExtension(), *instance);
+        auto* controller = sdk->documentController(); auto* api = controller->documentControllerInterface; auto dc = controller->documentControllerRef;
+        auto* binding = sdk->bind(kARAPlaybackRendererRole | kARAEditorRendererRole | kARAEditorViewRole, kARAPlaybackRendererRole | kARAEditorViewRole);
+        report << "ARA SDK factory: " << sdk->factory()->factoryID << "\n";
+        ARAMusicalContextProperties contextProperties{sizeof(contextProperties), "Song", 0, nullptr};
+        api->beginEditing(dc);
+        auto musicalContext = api->createMusicalContext(dc, hostRef<ARAMusicalContextHostRef>(10), &contextProperties);
+        ARARegionSequenceProperties sequenceProperties{sizeof(sequenceProperties), "Lead Vox", 0, musicalContext, nullptr};
+        auto sequence = api->createRegionSequence(dc, hostRef<ARARegionSequenceHostRef>(20), &sequenceProperties);
+        ARAAudioSourceProperties sourceProperties{sizeof(sourceProperties), "Lead Vox Take", "lead-vox-source", kAudioSourceLength, double(sampleRate), 2, kARAFalse, kARAChannelArrangementUndefined, nullptr};
+        auto source = api->createAudioSource(dc, hostRef<ARAAudioSourceHostRef>(30), &sourceProperties);
+        ARAAudioModificationProperties modificationProperties{sizeof(modificationProperties), "Lead Vox Edit", "lead-vox-edit"};
+        auto modification = api->createAudioModification(dc, source, hostRef<ARAAudioModificationHostRef>(40), &modificationProperties);
+        ARAPlaybackRegionProperties regionProperties{sizeof(regionProperties), kARAPlaybackTransformationNoChanges, 0, 1, 0, 1, nullptr, sequence, "Lead Vox Region", nullptr};
+        auto region = api->createPlaybackRegion(dc, modification, hostRef<ARAPlaybackRegionHostRef>(50), &regionProperties);
+        documentProperties.name = "Sample Document Updated"; api->updateDocumentProperties(dc, &documentProperties);
+        regionProperties.durationInModificationTime = 2; regionProperties.durationInPlaybackTime = 2; api->updatePlaybackRegionProperties(dc, region, &regionProperties);
+        api->endEditing(dc);
+        binding->playbackRendererInterface->addPlaybackRegion(binding->playbackRendererRef, region);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Preparing instance");
         instance->prepare(8, sampleRate);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Enabling audio source samples access");
-        ara->enable_audio_source_samples_access(ara, plugin, audioSourceId, true);
+        api->enableAudioSourceSamplesAccess(dc, source, kARATrue);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Enabled audio source samples access");
         report << "  sample access enabled=true\n";
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Activating instance");
@@ -442,7 +337,10 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
         aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
                      "Notifying audio source content change start=%d count=%d",
                      0, kContentChangeCount);
-        ara->notify_audio_source_content_changed(ara, plugin, audioSourceId, 0, kContentChangeCount);
+        ARAContentTimeRange changedRange{0, double(kContentChangeCount) / sampleRate};
+        api->beginEditing(dc);
+        api->updateAudioSourceContent(dc, source, &changedRange, kARAContentUpdateEverythingChanged);
+        api->endEditing(dc);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Audio source content change notified");
         report << "  content change notified\n";
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Re-activating instance for post-change capture");
@@ -475,29 +373,20 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
         report << "  verification=" << boolString(verified) << "\n";
 
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Disabling audio source samples access");
-        ara->enable_audio_source_samples_access(ara, plugin, audioSourceId, false);
+        api->enableAudioSourceSamplesAccess(dc, source, kARAFalse);
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Disabled audio source samples access");
         report << "  sample access enabled=false\n";
 
         report << "\nDestroying ARA model...\n";
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Beginning ARA destroy transaction");
-        ara->begin_model_update(ara, plugin, AAP_ARA_MODEL_UPDATE_FLAG_NONE);
-        ara->destroy_playback_region(ara, plugin, playbackRegionId);
-        ara->destroy_audio_modification(ara, plugin, audioModificationId);
-        ara->destroy_audio_source(ara, plugin, audioSourceId);
-        ara->destroy_region_sequence(ara, plugin, regionSequenceId);
-        ara->destroy_musical_context(ara, plugin, musicalContextId);
-        ara->destroy_document(ara, plugin, documentId);
-        ara->end_model_update(ara, plugin);
-        aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Completed ARA destroy transaction");
-        report << "  destroy transaction completed\n";
-
-        host_context.runtime.unregisterAudioSource(audioSourceId);
-        aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
-                     "Unregistered host audio source id=%d", audioSourceId);
-        host_bridge.reset();
+        binding->playbackRendererInterface->removePlaybackRegion(binding->playbackRendererRef, region);
+        api->beginEditing(dc);
+        api->destroyPlaybackRegion(dc, region); api->destroyAudioModification(dc, modification); api->destroyAudioSource(dc, source);
+        api->destroyRegionSequence(dc, sequence); api->destroyMusicalContext(dc, musicalContext);
+        api->endEditing(dc);
+        sdk.reset(); host_bridge.reset();
         client->destroyInstance(instance);
-        delete client;
+        client.reset();
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "runScenario completed successfully");
 
         return env->NewStringUTF(report.str().c_str());
@@ -516,29 +405,20 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_runScenario(
 // An editor session is confined to the activity's single worker thread. The host
 // bridge outlives all model calls, including reverse sample-read callbacks.
 namespace {
-class ToneProvider : public aap::ara::AudioSourceContentProvider {
+class ToneProvider : public SampleAudioSource {
     int rate;
 public:
     float frequency = 220, gain = 0.2f;
     explicit ToneProvider(int rate_) : rate(rate_) {}
     int32_t channelCount() const override { return 2; }
     double sampleRate() const override { return rate; }
-    aap_ara_sample_count_t sampleCount() const override { return rate * 60; }
-    uint32_t supportedSampleFormats() const override { return AAP_ARA_SAMPLE_FORMAT_FLOAT32; }
-    bool readSamples(const aap_ara_audio_source_sample_range_t& r,
-                     aap_ara_audio_source_samples_buffer_t& d) override {
-        if (r.sample_format != AAP_ARA_SAMPLE_FORMAT_FLOAT32 || r.start_sample < 0 ||
-            r.sample_count <= 0 || r.channel_count <= 0 || r.start_sample >= sampleCount()) return false;
-        auto frames = std::min(r.sample_count, sampleCount() - r.start_sample);
-        auto channels = std::min(r.channel_count, 2);
-        size_t bytes = size_t(frames) * channels * sizeof(float);
-        if (!d.data || d.data_size < bytes) return false;
-        auto* data = static_cast<float*>(d.data);
-        for (int c = 0; c < channels; ++c)
-            for (int i = 0; i < frames; ++i)
-                data[c * frames + i] = gain * std::sin(6.283185307179586 * frequency * (r.start_sample + i) / rate);
-        d.data_size = bytes; d.sample_count = frames; d.channel_count = channels;
-        d.sample_format = AAP_ARA_SAMPLE_FORMAT_FLOAT32;
+    ARASampleCount sampleCount() const override { return rate * 60; }
+    bool readSamples(ARASamplePosition start, ARASampleCount count, void* const buffers[], bool wide) override {
+        if (start < 0 || count < 0 || start > sampleCount() || count > sampleCount() - start) return false;
+        for (int c = 0; c < 2; ++c) for (int64_t i = 0; i < count; ++i) {
+            auto value = gain * std::sin(6.283185307179586 * frequency * (start + i) / rate);
+            if (wide) static_cast<double*>(buffers[c])[i] = value; else static_cast<float*>(buffers[c])[i] = value;
+        }
         return true;
     }
 };
@@ -547,11 +427,19 @@ struct EditorClip { int track; std::string name, plugin_state; double start, off
 struct EditorSession {
     std::unique_ptr<aap::PluginClient> client;
     aap::RemotePluginInstance* instance{};
-    aap::ara::HostRuntime runtime;
+    SampleHostServices runtime;
     std::unique_ptr<aap::ara::ScopedRemotePluginInstanceARAHostContext> bridge;
     // Worker-owned facade for the editor's serialized model calls.
     std::unique_ptr<aap::xs::AraClientAAPXS> ara_client;
-    aap_ara_extension_t* ara{};
+    std::unique_ptr<aap::ara::Host> sdk;
+    const ARADocumentControllerInterface* ara{};
+    ARADocumentControllerRef dc{};
+    const ARAPlugInExtensionInstance* binding{};
+    ARAMusicalContextRef musicalContext{};
+    std::map<int, ARARegionSequenceRef> sequenceRefs;
+    std::map<int, ARAAudioSourceRef> sourceRefs;
+    std::map<int, ARAAudioModificationRef> modificationRefs;
+    std::map<int, ARAPlaybackRegionRef> regionRefs;
     AndroidAudioPlugin* plugin{};
     int rate;
     std::map<int, std::string> tracks;
@@ -560,33 +448,29 @@ struct EditorSession {
     bool supports_archive = false;
     bool supports_selection = false;
     std::mutex updates_mutex;
-    std::vector<aap_ara_content_update_t> pending_updates;
+    std::vector<SampleContentUpdate> pending_updates;
     explicit EditorSession(int rate_) : rate(rate_) {
-        runtime.setContentUpdateHandler([this](const aap_ara_content_update_t& update) {
-            const std::lock_guard<std::mutex> lock(updates_mutex);
-            pending_updates.push_back(update);
-        });
+        runtime.onUpdate = [this](SampleContentUpdate update) {
+            const std::lock_guard<std::mutex> lock(updates_mutex); pending_updates.push_back(update);
+        };
     }
     void removeClip(int id) {
-        ara->destroy_playback_region(ara, plugin, id);
-        ara->destroy_audio_modification(ara, plugin, id);
-        ara->enable_audio_source_samples_access(ara, plugin, id, false);
-        ara->destroy_audio_source(ara, plugin, id);
-        runtime.unregisterAudioSource(id);
-        clips.erase(id);
+        binding->playbackRendererInterface->removePlaybackRegion(binding->playbackRendererRef, regionRefs.at(id));
+        ara->destroyPlaybackRegion(dc, regionRefs.at(id)); ara->destroyAudioModification(dc, modificationRefs.at(id));
+        ara->enableAudioSourceSamplesAccess(dc, sourceRefs.at(id), kARAFalse); ara->destroyAudioSource(dc, sourceRefs.at(id));
+        runtime.unregisterAudioSource(id); clips.erase(id); regionRefs.erase(id); modificationRefs.erase(id); sourceRefs.erase(id);
     }
     ~EditorSession() {
-        runtime.setContentUpdateHandler({});
-        if (document_created) {
-            ara->begin_model_update(ara, plugin, 0);
+        runtime.onUpdate = {};
+        try { if (document_created) {
+            ara->beginEditing(dc);
             while (!clips.empty()) removeClip(clips.begin()->first);
-            for (auto& t : tracks) ara->destroy_region_sequence(ara, plugin, t.first);
-            ara->destroy_musical_context(ara, plugin, 1);
-            ara->destroy_document(ara, plugin, 1);
-            ara->end_model_update(ara, plugin);
+            for (auto& t : sequenceRefs) ara->destroyRegionSequence(dc, t.second);
+            ara->destroyMusicalContext(dc, musicalContext); ara->endEditing(dc);
+        }} catch (const std::exception& e) {
+            aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG, "ARA editor teardown: %s", e.what());
         }
-        bridge.reset();
-        ara_client.reset();
+        sdk.reset(); bridge.reset(); ara_client.reset();
         if (instance) client->destroyInstance(instance);
     }
 };
@@ -599,7 +483,7 @@ std::string archive_hex(const void* data, size_t size) {
     return text;
 }
 bool archive_bytes(const std::string& text, std::vector<uint8_t>& data) {
-    if (text.size() % 2 || text.size() > AAP_ARA_MAX_ARCHIVE_BYTES * 2) return false;
+    if (text.size() % 2 || text.size() > 64 * 1024 * 1024) return false;
     auto digit = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
     for (size_t i = 0; i < text.size(); i += 2) {
         int a = digit(text[i]), b = digit(text[i + 1]);
@@ -632,26 +516,21 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_openEditor(
         session->instance = dynamic_cast<aap::RemotePluginInstance*>(session->client->getInstanceById(result.value));
         if (!session->instance) throw std::runtime_error("No remote plugin instance");
         session->plugin = session->instance->getPlugin();
-        session->ara = static_cast<aap_ara_extension_t*>(session->plugin->get_extension(session->plugin, AAP_ARA_EXTENSION_URI));
-        if (!session->ara) throw std::runtime_error("Plugin has no ARA extension");
+        auto* transport = static_cast<aap_ara_extension_t*>(session->plugin->get_extension(session->plugin, AAP_ARA_EXTENSION_URI));
+        if (!transport) throw std::runtime_error("Plugin has no ARAAAP extension");
         auto* initiator = session->instance->getAAPXSDispatcher().getPluginAAPXSByUri(AAP_ARA_EXTENSION_URI);
         session->ara_client = std::make_unique<aap::xs::AraClientAAPXS>(initiator, initiator->serialization);
-        session->ara = session->ara_client->asPluginExtension();
-        aap_ara_factory_capability_t capability{};
-        capability.struct_size = sizeof(capability);
-        session->ara->get_factory_capability(session->ara, session->plugin, &capability);
-        session->supports_archive = capability.struct_size >= sizeof(capability) &&
-            (capability.supported_features & AAP_ARA_FEATURE_MODIFICATION_ARCHIVE);
-        session->supports_selection = capability.struct_size >= sizeof(capability) &&
-            (capability.supported_features & AAP_ARA_FEATURE_VIEW_SELECTION);
-        session->bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(session->runtime, *session->instance);
+        ARADocumentProperties doc{sizeof(doc), "Untitled Project"};
+        session->sdk = std::make_unique<aap::ara::Host>(session->plugin, session->ara_client->asPluginExtension(), &session->runtime.instance, &doc);
+        session->bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(session->sdk->transportExtension(), *session->instance);
+        auto* controller = session->sdk->documentController(); session->ara = controller->documentControllerInterface; session->dc = controller->documentControllerRef;
+        session->binding = session->sdk->bind(kARAPlaybackRendererRole | kARAEditorRendererRole | kARAEditorViewRole, kARAPlaybackRendererRole | kARAEditorViewRole);
+        session->supports_archive = true; session->supports_selection = session->binding->editorViewInterface != nullptr;
         session->instance->prepare(8, rate);
-        session->ara->begin_model_update(session->ara, session->plugin, 0);
-        aap_ara_document_properties_t doc{sizeof(doc), "Untitled Project", "editor-document"};
-        aap_ara_musical_context_properties_t context{sizeof(context), "Song", nullptr, "editor-song"};
-        session->ara->create_document(session->ara, session->plugin, 1, &doc);
-        session->ara->create_musical_context(session->ara, session->plugin, 1, 1, &context);
-        session->ara->end_model_update(session->ara, session->plugin);
+        session->ara->beginEditing(session->dc);
+        ARAMusicalContextProperties context{sizeof(context), "Song", 0, nullptr};
+        session->musicalContext = session->ara->createMusicalContext(session->dc, hostRef<ARAMusicalContextHostRef>(1), &context);
+        session->ara->endEditing(session->dc);
         session->document_created = true;
         editor = std::move(session);
         return env->NewStringUTF("");
@@ -682,11 +561,13 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_notifyEditorSel
     for (auto id : tracks)
         if (!s.tracks.count(id))
             return env->NewStringUTF("Unknown selected track");
-    const std::vector<int64_t> regions(clips.begin(), clips.end()), sequences(tracks.begin(), tracks.end());
-    const aap_ara_view_selection_t selection{sizeof(selection), 1,
-        static_cast<uint32_t>(regions.size()), regions.data(), static_cast<uint32_t>(sequences.size()), sequences.data(),
-        hasRange != 0, start, duration};
-    return env->NewStringUTF(s.ara->notify_selection(s.ara, s.plugin, &selection) ? "" : "Plugin rejected host selection");
+    std::vector<ARAPlaybackRegionRef> regions; std::vector<ARARegionSequenceRef> sequences;
+    for (auto id : clips) regions.push_back(s.regionRefs.at(id));
+    for (auto id : tracks) sequences.push_back(s.sequenceRefs.at(id));
+    ARAContentTimeRange range{start, duration};
+    ARAViewSelection selection{sizeof(selection), regions.size(), regions.data(), sequences.size(), sequences.data(), hasRange ? &range : nullptr};
+    try { s.binding->editorViewInterface->notifySelection(s.binding->editorViewRef, &selection); return env->NewStringUTF(""); }
+    catch (const std::exception& e) { return env->NewStringUTF(e.what()); }
 }
 
 // Drain on the editor worker, after the reverse Binder callback has returned.
@@ -696,27 +577,24 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_drainPluginUpda
     std::vector<std::string> result;
     if (editor && editor->supports_archive) {
         auto& s = *editor;
-        std::vector<aap_ara_content_update_t> updates;
+        s.ara->notifyModelUpdates(s.dc);
+        std::vector<SampleContentUpdate> updates;
         {
             const std::lock_guard<std::mutex> lock(s.updates_mutex);
             updates.swap(s.pending_updates);
         }
         std::set<int> ids;
         for (const auto& update : updates) {
-            if (update.kind == AAP_ARA_CONTENT_DOCUMENT) for (const auto& clip : s.clips) ids.insert(clip.first);
-            else if (update.kind >= AAP_ARA_CONTENT_AUDIO_SOURCE && update.kind <= AAP_ARA_CONTENT_PLAYBACK_REGION &&
+            if (update.kind == 4) for (const auto& clip : s.clips) ids.insert(clip.first);
+            else if (update.kind >= 1 && update.kind <= 3 &&
                      s.clips.count(update.object_id)) ids.insert(update.object_id);
         }
         for (int id : ids) {
-            std::array<uint8_t, AAP_ARA_MAX_ARCHIVE_BYTES> bytes{};
-            aap_ara_archive_buffer_t archive{sizeof(archive), bytes.data(), bytes.size(), 0};
-            if (!s.ara->store_audio_modification_state(s.ara, s.plugin, id, &archive)) {
-                // A failed fetch must not lose the dirty notification.
-                const std::lock_guard<std::mutex> lock(s.updates_mutex);
-                s.pending_updates.push_back({sizeof(aap_ara_content_update_t), AAP_ARA_CONTENT_AUDIO_MODIFICATION, id, 0, false, 0, 0});
-                continue;
+            std::string bytes;
+            if (!s.sdk->storeModification(s.modificationRefs.at(id), bytes)) {
+                const std::lock_guard<std::mutex> lock(s.updates_mutex); s.pending_updates.push_back({2, id}); continue;
             }
-            auto state = archive_hex(bytes.data(), archive.data_size);
+            auto state = archive_hex(bytes.data(), bytes.size());
             if (s.clips.at(id).plugin_state == state) continue;
             s.clips.at(id).plugin_state = state;
             result.push_back(std::to_string(id)); result.push_back(state);
@@ -762,7 +640,7 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
         auto item = static_cast<jstring>(env->GetObjectArrayElement(array, i));
         auto name = jstringToStdString(env, item); env->DeleteLocalRef(item); return name;
     };
-    auto* a = s.ara; auto* p = s.plugin;
+    auto* a = s.ara; auto p = s.dc;
     std::vector<std::string> states;
     std::vector<std::vector<uint8_t>> archives(nc);
     for (int i = 0; i < nc; ++i) {
@@ -770,10 +648,10 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
         if (!archive_bytes(states.back(), archives[i])) return env->NewStringUTF("Invalid plugin state archive");
         if (!s.supports_archive && !states.back().empty()) return env->NewStringUTF("Plugin does not support modification archives");
     }
-    a->begin_model_update(a, p, 0);
+    a->beginEditing(p);
     auto name = jstringToStdString(env, title);
-    aap_ara_document_properties_t doc{sizeof(doc), name.c_str(), "editor-document"};
-    a->update_document_properties(a, p, 1, &doc);
+    ARADocumentProperties doc{sizeof(doc), name.c_str()};
+    a->updateDocumentProperties(p, &doc);
     for (auto it = s.clips.begin(); it != s.clips.end();) {
         int id = (it++)->first;
         if (std::find(ids.begin(), ids.end(), id) == ids.end()) s.removeClip(id);
@@ -781,9 +659,9 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
     // Create new sequences before moving clips; remove obsolete sequences last.
     for (int i = 0; i < nt; ++i) {
         auto n = nameAt(trackNames, i), persistent = "track-" + std::to_string(tids[i]);
-        aap_ara_region_sequence_properties_t props{sizeof(props), n.c_str(), i, 1, nullptr, persistent.c_str()};
-        if (s.tracks.count(tids[i])) a->update_region_sequence_properties(a, p, tids[i], &props);
-        else a->create_region_sequence(a, p, 1, tids[i], &props);
+        ARARegionSequenceProperties props{sizeof(props), n.c_str(), i, s.musicalContext, nullptr};
+        if (s.tracks.count(tids[i])) a->updateRegionSequenceProperties(p, s.sequenceRefs.at(tids[i]), &props);
+        else s.sequenceRefs[tids[i]] = a->createRegionSequence(p, hostRef<ARARegionSequenceHostRef>(tids[i]), &props);
         s.tracks[tids[i]] = n;
     }
     for (int i = 0; i < nc; ++i) {
@@ -796,26 +674,27 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
         if (fresh) {
             c.provider = std::make_shared<ToneProvider>(s.rate);
             s.runtime.registerAudioSource(id, c.provider);
-            aap_ara_audio_source_properties_t source{sizeof(source), n.c_str(), persistent.c_str(), s.rate * 60, double(s.rate), 2, false, "stereo"};
-            a->create_audio_source(a, p, 1, id, &source);
-            aap_ara_audio_modification_properties_t modification{sizeof(modification), n.c_str(), persistent.c_str()};
-            a->create_audio_modification(a, p, id, id, &modification);
+            ARAAudioSourceProperties source{sizeof(source), n.c_str(), persistent.c_str(), s.rate * 60, double(s.rate), 2, kARAFalse, kARAChannelArrangementUndefined, nullptr};
+            s.sourceRefs[id] = a->createAudioSource(p, hostRef<ARAAudioSourceHostRef>(id), &source);
+            ARAAudioModificationProperties modification{sizeof(modification), n.c_str(), persistent.c_str()};
+            s.modificationRefs[id] = a->createAudioModification(p, s.sourceRefs.at(id), hostRef<ARAAudioModificationHostRef>(id), &modification);
         }
         c.provider->frequency = c.frequency; c.provider->gain = c.gain;
-        aap_ara_playback_region_properties_t region{sizeof(region), 0, c.offset, c.duration, c.start, c.duration, c.track, n.c_str(), nullptr};
-        if (fresh) a->create_playback_region(a, p, id, id, &region);
+        ARAPlaybackRegionProperties region{sizeof(region), kARAPlaybackTransformationNoChanges, c.offset, c.duration, c.start, c.duration, nullptr, s.sequenceRefs.at(c.track), n.c_str(), nullptr};
+        if (fresh) { s.regionRefs[id] = a->createPlaybackRegion(p, s.modificationRefs.at(id), hostRef<ARAPlaybackRegionHostRef>(id), &region);
+            s.binding->playbackRendererInterface->addPlaybackRegion(s.binding->playbackRendererRef, s.regionRefs.at(id)); }
         else {
-            a->update_playback_region_properties(a, p, id, &region);
-            aap_ara_audio_source_properties_t source{sizeof(source), n.c_str(), persistent.c_str(), s.rate * 60, double(s.rate), 2, false, "stereo"};
-            a->update_audio_source_properties(a, p, id, &source);
-            aap_ara_audio_modification_properties_t modification{sizeof(modification), n.c_str(), persistent.c_str()};
-            a->update_audio_modification_properties(a, p, id, &modification);
+            a->updatePlaybackRegionProperties(p, s.regionRefs.at(id), &region);
+            ARAAudioSourceProperties source{sizeof(source), n.c_str(), persistent.c_str(), s.rate * 60, double(s.rate), 2, kARAFalse, kARAChannelArrangementUndefined, nullptr};
+            a->updateAudioSourceProperties(p, s.sourceRefs.at(id), &source);
+            ARAAudioModificationProperties modification{sizeof(modification), n.c_str(), persistent.c_str()};
+            a->updateAudioModificationProperties(p, s.modificationRefs.at(id), &modification);
         }
-        if (fresh) a->enable_audio_source_samples_access(a, p, id, true);
-        else if (changed) a->notify_audio_source_content_changed(a, p, id, 0, s.rate * 60);
+        if (fresh) a->enableAudioSourceSamplesAccess(p, s.sourceRefs.at(id), kARATrue);
+        else if (changed) { ARAContentTimeRange range{0, 60}; a->updateAudioSourceContent(p, s.sourceRefs.at(id), &range, kARAContentUpdateEverythingChanged); }
         if (s.supports_archive && c.plugin_state != states[i]) {
-            if (!a->restore_audio_modification_state(a, p, id, archives[i].data(), archives[i].size())) {
-                a->end_model_update(a, p);
+            if (!s.sdk->restoreModification(s.modificationRefs.at(id), archives[i].data(), archives[i].size())) {
+                a->endEditing(p);
                 return env->NewStringUTF("Plugin rejected modification archive");
             }
             c.plugin_state = states[i];
@@ -823,10 +702,10 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_syncEditor(
     }
     for (auto it = s.tracks.begin(); it != s.tracks.end();) {
         if (std::find(tids.begin(), tids.end(), it->first) == tids.end()) {
-            a->destroy_region_sequence(a, p, it->first); it = s.tracks.erase(it);
+            a->destroyRegionSequence(p, s.sequenceRefs.at(it->first)); s.sequenceRefs.erase(it->first); it = s.tracks.erase(it);
         } else ++it;
     }
-    a->end_model_update(a, p);
+    a->endEditing(p);
     return env->NewStringUTF("");
 }
 
@@ -838,9 +717,8 @@ Java_org_androidaudioplugin_aaparahostsample_AraHostSampleNative_verifyEditorAud
     if (!editor || !editor->clips.count(clipId)) return env->NewStringUTF("Missing editor clip");
     auto& s = *editor;
     std::array<float, 256> samples{};
-    aap_ara_audio_source_sample_range_t range{sizeof(range), 64, 128, 2, AAP_ARA_SAMPLE_FORMAT_FLOAT32};
-    aap_ara_audio_source_samples_buffer_t destination{sizeof(destination), samples.data(), sizeof(samples), 0, 0, 0};
-    s.clips.at(clipId).provider->readSamples(range, destination);
+    void* buffers[]{samples.data(), samples.data() + 128};
+    s.clips.at(clipId).provider->readSamples(64, 128, buffers, false);
     auto expected = [&](const float* data) { return std::array<float, 4>{data[0], data[1], compute_rms(data, 128), compute_peak(data, 128)}; };
     auto left = expected(samples.data()), right = expected(samples.data() + 128);
     for (int i = 0; i < 4; ++i) { left[i] *= modificationGain; right[i] *= modificationGain; }

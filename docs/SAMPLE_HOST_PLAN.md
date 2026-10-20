@@ -1,4 +1,4 @@
-# ARA Sample Host Plan
+# ARA Sample Host Plan (AI slop)
 
 ## Purpose
 
@@ -25,16 +25,14 @@ policy or pretend every host instance supports ARA features.
 
 ### `androidaudioplugin-ara`
 
-`androidaudioplugin-ara` should provide the reusable ARA-specific host-side C++
-helper surface. The first piece of that is `aap::ara::HostRuntime`, which owns:
+`androidaudioplugin-ara` provides ARAAAP, backed by the upstream ARA SDK:
 
-- host capability callbacks,
-- host-side audio-source registration,
-- host-side sample-read dispatch,
-- plugin-originated content-update callbacks.
+- `aap::ara::Host` exposes SDK document-controller and role proxies;
+- `aap::ara::PlugIn` dispatches to an application's real SDK factory/controller;
+- SDK host callbacks provide audio, archives, optional musical content and playback;
+- AAPXS carries flattened calls and chunked audio/archive data across Binder.
 
-Future ARA host helper classes can extend this area with document/archive and
-content-access helpers.
+See [ARA.md](ARA.md) for the SDK dependency, application API, and transport limits.
 
 ### `samples:aaparahostsample`
 
@@ -55,7 +53,7 @@ observable behaviors.
 - host updates properties,
 - host destroys the graph cleanly.
 
-This proves the AAP-native ARA object model can be driven across the host/plugin
+This proves the upstream SDK ARA object model can be driven across the host/plugin
 boundary.
 
 ### Milestone 2: prefetched audio source access
@@ -84,7 +82,7 @@ This demonstrates that the plug-in is not using stale cached data.
 
 The current implementation covers milestones 1 through 3 and a small project editor:
 
-- `aap::ara::HostRuntime` provides host capability and sample-read callbacks,
+- `aap::ara::Host` wraps real SDK host services and document-controller calls,
 - the sample host registers a deterministic stereo source provider,
 - the sample plug-in reads host-provided samples and computes verification
   metrics,
@@ -102,13 +100,15 @@ This is the minimum viable ARA-prefetch demonstration for AAP.
 
 ### Archive persistence
 
-Compact per-modification opaque archives and project JSON persistence are
-implemented. Full ARA document archive-controller semantics remain future work.
+The integration implements the SDK archive-controller interfaces, object filters,
+and ID remapping with chunked transfers. The sample persists per-modification
+SDK archives in its project JSON; its UI does not expose whole-document archives.
 
 ### Musical content and timeline synchronization
 
-Arrangement and bidirectional content updates are implemented. Tempo, meter and
-musical content-reader APIs remain future work.
+The integration carries SDK tempo, meter and musical content readers as well as
+arrangement and bidirectional content updates. The native SDK tests exercise host
+tempo and plug-in note readers; a musical-content editor remains sample UI work.
 
 ### Multiple audio sources and playback regions
 
@@ -127,8 +127,8 @@ remain future work.
 
 ## Acceptance criteria for the sample
 
-The sample should not be considered a valid ARA example unless all of the
-following are true:
+The sample must use the upstream SDK factory, document controller, types, and
+companion binding, and must demonstrate all of the following:
 
 - the host provides the required ARA services itself,
 - the plug-in performs non-realtime source sample reads through the ARA host

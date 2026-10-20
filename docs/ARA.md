@@ -1,197 +1,214 @@
-# ARA Integration in AAP
+# ARAAAP: ARA SDK integration for Audio Plugins For Android (AI slop)
 
-## Goal
+ARAAAP is the AAP companion integration for Celemony's ARA SDK. It exposes the
+upstream `ARAFactory`, `ARADocumentControllerInstance`, and
+`ARAPlugInExtensionInstance` contracts, with AAPXS adapters for Android's separate
+host and plug-in processes. Applications implement the ARA SDK interfaces; they
+do not implement a second document-model API.
 
-Define and implement an AAP-native ARA extension family so that AAP has its own
-equivalent of `ARA VST3`, `ARA AU`, or `ARA CLAP`.
+The SDK is a recursive submodule at `external/ARA_SDK`, pinned to the public
+`releases/2.3.0` tag (`0005c53`). Its `ARA_API`, `ARA_Library`, and `ARA_Examples`
+submodules retain their upstream licenses. We use the released ARA 2 interfaces.
+The SDK's experimental IPC code is not part of this tagged release, so ARAAAP
+provides its own Android transport adapters.
 
-The ARA features should be exposed only through AAP extension APIs plus AAPXS
-transport where needed. They should not be modeled as forwarded calls into
-VST3, CLAP, Audio Unit, or any other foreign plug-in API.
+## Getting the SDK and building
 
-## Repository boundary
+```sh
+git submodule update --init --recursive
+./gradlew :samples:aaparahostsample:assembleDebug :samples:aaparapluginsample:assembleDebug
+```
 
-ARA uses aap-core's role-aware AAPXS lifecycle (`docs/AAPXS_LIFECYCLE.md`).
-The dispatcher creates the canonical `AraClientAAPXS` / `AraServiceAAPXS`
-context before proxy lookup and releases it through the initiator lifecycle
-hook. Proxy getters borrow that context without lazy creation or a shared mutex.
-Rebuild ARA and its native consumers together with this SDK update; its ARA
-extension API and serialization remain unchanged.
+The native modules include `cmake/ARASDK.cmake`, which adds the SDK's CMake targets.
+`-DARA_SDK_ROOT=/absolute/path/to/ARA_SDK` can select an existing SDK checkout.
+CMake never downloads a moving branch. The Android package builds `arm64-v8a` and
+`x86_64`: the upstream SDK does not define a 32-bit ARM ABI.
 
-The AAP-native public API belongs in `aap-core`.
+The AAR's Prefab module exports ARAAAP headers, `ARA_API/ARAInterface.h`, and the
+upstream API license. A C API implementation can consume those headers directly:
 
-If implementation work later needs the upstream ARA SDK or any companion-SDK
-dependent helper code, that should live outside `aap-core` in a sibling
-repository such as `aap-ara`. This keeps potential licensing, redistribution,
-and dependency-management issues out of the core AAP repository while allowing
-`aap-core` to define the stable AAP-facing contract.
+```cmake
+find_package(androidaudioplugin REQUIRED CONFIG)
+find_package(androidaudioplugin-ara REQUIRED CONFIG)
+target_link_libraries(my_plugin PRIVATE
+    androidaudioplugin::androidaudioplugin
+    androidaudioplugin-ara::androidaudioplugin-ara)
+```
 
-## Upstream status
+For the SDK's C++ implementation helpers, also add your SDK checkout and link its
+plug-in library, as the sample does:
 
-As of `2026-06-10`, the latest tagged public ARA SDK release is `2.3.0`
-(`2025-11-06`). Upstream `main` is documented by Celemony as work in progress
-and should not be treated as a stable product target.
+```cmake
+set(ARA_API_DIR "${ARA_SDK_ROOT}/ARA_API")
+add_subdirectory("${ARA_SDK_ROOT}/ARA_Library" "${CMAKE_BINARY_DIR}/ARA_SDK")
+target_link_libraries(my_plugin PRIVATE ARA_PlugIn_Library)
+```
 
-Implications:
+Do not include an unrelated copy of `ARAInterface.h` with a different ABI or
+configuration. ARA SDK release upgrades must be tested with ARAAAP.
 
-- production work should target `ARA 2.x` first,
-- any `ARA 3` work in AAP should remain explicitly experimental.
+## Plug-in implementation
 
-## What AAP has to implement
+`include/aap/ara/ARAAAP.h` defines the companion entry point, analogous to the SDK's
+ARACLAP/ARAVST3 integrations. `ARAAAPPlugInExtension` provides:
 
-If AAP wants true ARA support, it needs AAP-native equivalents for the host
-facilities that ARA-capable AAP plug-ins expect:
+- `getFactory(plugin)`: the plug-in's ordinary, static SDK `ARAFactory`;
+- `bindToDocumentController(plugin, ref, knownRoles, assignedRoles)`: one-time
+  instance binding, returning the SDK's `ARAPlugInExtensionInstance`.
 
-- document controller lifecycle,
-- musical context objects,
-- region sequence / playback region management,
-- random access to audio source samples outside `process()`,
-- transport and time conversion,
-- tempo, meter, key, and content update notifications,
-- persistence for ARA archives and edit state,
-- editor selection/focus integration.
+A plug-in using the C++ library can implement these with
+`ARA::PlugIn::PlugInEntry::getPlugInEntry<Config, Controller>()` and `ARA::PlugIn::PlugInExtension::bindToARA`.
+The sample implements `SampleDocumentController`, `SampleSource`, and
+`SampleModification` using the SDK's model classes. It reads audio through
+`ARA::PlugIn::HostAudioReader` and implements the SDK's archive delegate hooks.
+Its Compose snapshot is a display cache derived from SDK objects.
 
-These are larger than a normal plug-in extension. They form a host-side model.
+Construct `aap::ara::PlugIn` with the AAP instance, its host, and this companion
+extension. Delegate AAP `get_extension` to `adapter.getExtension(uri)`. This
+returns the local companion entry point for `ARA_AAP_PLUGIN_EXTENSION_URI` and
+the process-safe transport for `ARA_AAP_TRANSPORT_EXTENSION_URI`. Advertise the
+transport URI (`urn://androidaudioplugin.org/extensions/ara/v2`) in AAP metadata.
 
-The most likely first host implementation for this is not `aap-core` alone but
-an AAP DAW host such as UAPMD.
+All SDK model calls run on a shared model thread inside the plug-in process.
+Binder dispatch may change threads between requests, so serializing calls alone
+is insufficient. Route plug-in UI edits and binding teardown through
+`adapter.synchronize(...)` as well. Publish immutable data for audio/UI threads.
 
-## Extension-shape direction
+Before releasing an AAP instance:
 
-The new AAP ARA work should look like an AAP extension family with:
+1. call `adapter.prepareForRelease()` while its SDK binding is alive;
+2. destroy the application's SDK binding through `adapter.synchronize(...)`;
+3. destroy the adapter and AAP instance.
 
-- plugin-side ARA extension APIs,
-- host-side ARA extension APIs,
-- AAPXS request/reply transport for non-RT control traffic,
-- shared-memory or file-descriptor based transport for large non-RT audio data,
-- persistence hooks that align with AAP state management.
+This also handles the host destroying its controller first. The adapter removes
+outstanding role assignments and destroys model dependencies in order. Factory
+initialization is reference-counted per SDK factory and uninitialization follows
+controller/binding teardown.
 
-The important rule is that the public AAP-facing contract is the AAP ARA
-extension itself. Internal implementation details can vary, but the host/plugin
-relationship must be defined in AAP terms.
+## Host implementation
 
-## Recommended execution order
+Provide the actual SDK `ARADocumentControllerHostInstance` callbacks for audio,
+archives, and optional content, model updates, and playback requests. Construct
+`aap::ara::Host` with the AAP instance, host services, and
+`ARADocumentProperties`. It negotiates the requested API generation with the real
+remote factory, initializes it, and creates its SDK controller.
 
-### Phase 1: capability advertisement
+```cpp
+aap::ara::Host ara(plugin, &hostServices, &documentProperties);
+auto* dc = ara.documentController();
+auto* api = dc->documentControllerInterface;
+auto ref = dc->documentControllerRef;
+auto* roles = ara.bind(
+    ARA::kARAPlaybackRendererRole | ARA::kARAEditorViewRole,
+    ARA::kARAPlaybackRendererRole | ARA::kARAEditorViewRole);
 
-Add an explicit AAP extension that lets plug-ins and hosts declare:
+api->beginEditing(ref);
+auto source = api->createAudioSource(ref, sourceHostRef, &sourceProperties);
+// Create modifications, sequences, and regions using SDK types and references.
+api->endEditing(ref);
+api->enableAudioSourceSamplesAccess(ref, source, ARA::kARATrue);
+```
 
-- supported ARA generation,
-- broad renderer/editor role flags.
+Install `ara.transportExtension()` as the AAP host's transport extension before
+binding or creating model objects that can call back. With aap-core,
+`ScopedRemotePluginInstanceARAHostContext` installs this callback and preserves
+other host extensions. Register the AAPXS definition with `addToRegistry()`;
+the Android library's startup initializer does this for standard registries.
 
-This work starts in `include/aap/ext/ara.h`.
+`factory()` returns a local metadata copy of the remote SDK factory. Its
+initialization and controller-creation function pointers are intentionally absent:
+those operations are performed by the `Host` adapter. The document-controller and
+role interfaces are callable SDK proxies. Never send SDK pointers across Binder.
+Each AAP instance adapter owns one controller and binds that AAP instance once.
+Sharing one remote controller across multiple AAP instances is not provided by
+this adapter. Destroy the host adapter and scoped host context before releasing
+the corresponding remote AAP instance; their proxies borrow that connection.
 
-This is deliberately small. It avoids freezing the wrong transport or document
-model too early.
+The sample host supplies SDK audio-reader callbacks and creates, edits, and
+removes SDK objects. It explicitly assigns playback regions to its SDK renderer
+and sends `ARAViewSelection` through the SDK editor-view interface.
 
-### Phase 2: define the AAP host-side ARA model
+## Content, archives, and notifications
 
-Before adding lots of IPC, define the AAP equivalents for:
+The adapters carry SDK content availability/grade queries, content analysis,
+content readers, undo deactivation, cloning, processing algorithms, licensing
+queries, renderer region/sequence assignments, selection, and hidden sequences.
+Optional host tempo/content and playback services are exposed only when supplied.
+Content events serialize scalar fields and strings, accounting for SDK struct
+packing differences between ARM and x86; pointers are reconstructed locally.
+Supported event types are notes, tempo entries, bar signatures, tuning, keys, and
+chords. The reserved beatmarker type has no released event representation here.
 
-- audio sources and sample readers,
-- playback regions,
-- musical contexts,
-- host edit transactions,
-- archive persistence and restore,
-- host/editor notifications.
+Audio reads use chunked shared-memory transfers outside `process()`. SDK readers
+receive the requested planar float32 or float64 data. The adapter copies returned
+shared-memory data before another call can reuse the buffer.
 
-This should live as a dedicated AAP extension family, not as ad hoc special
-cases in `PluginInstance`.
+Archives use the real `storeObjectsToArchive`/`restoreObjectsFromArchive` and host
+archiving callbacks, including object filters and persistent-ID remapping.
+Archive/filter transfers are chunked; there is no 4 KiB total archive limit.
+Audio-file chunks are exposed when the remote factory advertises them.
+`storeModification`/`restoreModification` are sample convenience methods that
+wrap an SDK archive with its original modification ID, allowing clip duplication
+to restore the archive into a new modification. The host treats the bytes as
+opaque. The sample JSON uses hex encoding and limits one clip's encoded state to
+64 MiB. Restoration also accepts unwrapped archives and lets the SDK plug-in
+validate/import their format. The sample reader imports the old `gain-v1` state
+through the SDK restore filter, preserving saved edits during the initial project
+sync. Malformed, non-finite and out-of-range legacy gains are rejected without
+changing the existing modification or echoing a plug-in update.
 
-The first concrete draft of that API is now started in
-`include/aap/ext/ara.h` with:
+Plug-in edits call the SDK's queued notification methods. The host must poll
+`notifyModelUpdates()` outside edit transactions. Host callbacks enqueue work;
+fetch archives only after the callback has returned. Restoring host state must
+not echo a plug-in edit. Selection is transient and does not modify archives or
+undo history.
 
-- opaque object IDs for document, musical context, region sequence, audio
-  source, audio modification, and playback region,
-- versionable property structs for those objects,
-- host-driven plug-in extension entry points to create, update, and destroy the
-  model graph,
-- plug-in-driven host extension entry point for random-access source sample
-  reads.
+## Transport boundaries and current limits
 
-That is still intentionally incomplete, but it is enough to begin separate host
-and plug-in implementations against a shared graph contract.
+`include/aap/ext/ara.h` now forwards to the SDK companion API. The former custom
+graph types are private transport records under `aap/ara/internal/wire.h`.
+The incompatible transport uses `/ara/v2`, preventing older custom-protocol
+plug-ins from being mistaken for SDK-backed implementations.
 
-### Phase 3: add AAPXS transport
+Control messages use a 1 MiB AAPXS buffer. Factory/property text is limited to
+255 UTF-8 bytes; content-event names to 2047 bytes; channel arrangements to
+4096 bytes. Oversized SDK-facing properties fail instead of being truncated.
+Android supports undefined layouts and the SDK's VST3, AAX, CLAP map/ambisonic
+layout representations; Core Audio layouts require an Apple platform.
+Model calls belong on a serialized host worker, outside the audio thread.
+The C++ host adapter reports failed control queries as exceptions; hosts must
+handle those at their application boundary.
 
-Once the model is stable, add AAPXS-backed transport for non-realtime ARA data:
+The samples remain document editors with generated audio and diagnostic output;
+they do not implement audible timeline playback, file import, or time stretching.
+Their document objects, integration, sample reads, selection, and archives now
+exercise the upstream SDK.
 
-- lifecycle/control requests,
-- region and context synchronization,
-- content notifications,
-- editor coordination,
-- archive/state handoff.
+## Verification
 
-The first transport draft now also exists in
-`include/aap/core/aapxs/ara-aapxs.h` with:
+```sh
+cmake -S tests -B build/native-tests -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/native-tests
+ctest --test-dir build/native-tests --output-on-failure
+```
 
-- dedicated AAPXS opcodes for graph lifecycle and updates,
-- flattened wire structs for pointer-based public property types,
-- a fixed control shared-memory budget for model messages,
-- a sample-read wire shape where the host writes returned audio into the
-  extension-owned shared-memory region rather than trying to pass process-local
-  pointers across IPC.
+Set `AAP_CORE_INCLUDE_DIR` when aap-core is not in the sibling checkout. The native
+suite uses the real SDK with debug API validation enabled and covers factory
+metadata, model-thread affinity, host tempo content, audio and note readers,
+roles/selection, cloning, archives larger than 4 KiB, ID remapping, and queued
+notifications. Android instrumentation tests exercise the sample editor and
+AAPXS/Binder path. Install the plug-in APK before running the host's tests.
 
-Do not route bulk sample reads through MIDI2 SysEx8. That path is wrong for
-random-access audio. Use shared memory, file descriptors, or another explicit
-non-RT mechanism.
-
-### Phase 4: first host integration
-
-The first serious integration target should be an AAP DAW host such as UAPMD,
-because that is where the document model, region ownership, transport, and
-persistence already have a place to live.
-
-## Host selection notifications
-
-`AAP_ARA_FEATURE_VIEW_SELECTION` negotiates the appended `notify_selection`
-callback in `aap_ara_extension_t`. An editor-view role alone does not imply that
-the callback is present. A new host must check the returned capability size and
-feature bit before accessing it; an old plugin continues to support its existing
-document operations. No aap-core change is required.
-
-`aap_ara_view_selection_t` is a complete replacement for one document's transient
-host selection: ordered playback-region IDs, ordered region-sequence IDs, and an
-optional explicit time interval in project seconds. Empty arrays and no range
-clear selection. Equal endpoints are a point. Object selection does not imply a
-derived bounding interval, and native MIDI note/controller identities are not
-part of this AAP view protocol.
-
-The callback borrows arrays only for its duration. Receivers copy them and reject
-invalid IDs or ranges atomically. Selection must not change document content,
-revision, undo history, modification archives, or trigger content notifications.
-Hosts send after model transactions complete and resend when opening/reopening
-the editor. Removing objects prunes selection; restoring content does not reselect
-it. Keep these calls serialized with model operations, outside the audio thread.
-
-AAPXS opcode 26 carries a 48-byte header followed by the two int64 ID arrays.
-The header includes the complete byte count because legacy Binder transport does
-not convey the sender's `data_size`. The receiver checks both counts, the embedded
-size and shared-memory capacity before reading IDs. The entire payload must fit
-the extension's 1 MiB budget; oversized selections fail rather than truncate.
-The reply reports whether the plugin accepted the selection. This traffic uses
-the existing Binder control path and never MIDI/SysEx8 processing.
-
-The sample host skips superseded pending notifications on its serialized worker.
-The sample plugin publishes a separate `selectionChanges` counter, allowing its
-Compose view to refresh highlights while the document revision remains unchanged.
-
-## Non-goals
-
-The following would be misleading:
-
-- exposing draft `ARA 3` as stable,
-- treating ARA as only a GUI concern,
-- forcing random-access audio into the realtime `process()` path,
-- defining the AAP ARA public contract in terms of foreign plug-in APIs.
-
-## Immediate next steps
-
-1. keep `include/aap/ext/ara.h` experimental while the graph API settles,
-2. implement the AAPXS wire contract in `include/aap/core/aapxs/ara-aapxs.h`,
-3. design the AAP-side document model around an actual host such as `uapmd`,
-4. add concrete host/plugin implementations on top of the draft transport.
-
-If the next implementation stage needs the upstream ARA SDK for validation,
-examples, or interop experiments, spin that work out into `aap-ara` rather
-than adding the SDK as a submodule of `aap-core`.
+Verified on 2026-10-20: both samples and the AAR build in Debug and Release for
+arm64-v8a and x86_64. The native SDK suite passes with debug API validation and
+with UndefinedBehaviorSanitizer. The Galaxy SM-X230 passes all six standalone
+host tests and ten plug-in tests (the host-only test is skipped in the plug-in
+runner), including hosted Compose editing, private endpoints, SDK archive
+restoration/ID remapping, legacy gain import, malformed archive rejection, and
+selection. The standalone host regression verifies initial content and restored
+gain through the plug-in's separate embedded surface, and also passes on the
+Pixel 11 Pro Fold. The SDK integration test also passed on the Pixel without a
+foreground display. The Galaxy's existing saved project was verified with both
+tracks, all three clips, host selection, and its preserved 0.52× gain edit.
+Release AAR/APK inspection confirms the exported API headers and packaged SDK
+license/notices.

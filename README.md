@@ -1,20 +1,20 @@
-# aap-ara
+# aap-ara (AI slop)
 
 ![samples sshot](docs/images/samples.jpg)
 
-Experimental AAP-native ARA extension package for Audio Plugins For Android.
+ARA SDK integration for Audio Plugins For Android, with an ARAAAP companion API and Android process adapters.
 
 This repository is intentionally separate from `aap-core` so that:
 
 - the AAP-facing ARA API can evolve without changing the core repository layout,
 - Prefab/native packaging can be shipped as its own AAR,
-- any future upstream ARA SDK experiments can live here without creating licensing or dependency pressure on `aap-core`.
+- the upstream ARA SDK dependency and its integration remain outside `aap-core`.
 
 ## Modules
 
-- `androidaudioplugin-ara`: AAR + Prefab package containing the ARA headers, native AAPXS implementation, and C++ host runtime helpers
-- `samples:aaparahostsample`: project editor using `aap::ara::HostRuntime`, with the original verification scenario available alongside editing
-- `samples:aaparapluginsample`: plug-in app that exposes the ARA extension, stores the model graph in memory, and performs host-driven sample reads
+- `androidaudioplugin-ara`: AAR + Prefab package containing ARAAAP and upstream API headers, SDK adapters, and AAPXS transport
+- `samples:aaparahostsample`: project editor using SDK document/host interfaces through `aap::ara::Host`, with the original verification scenario available alongside editing
+- `samples:aaparapluginsample`: plug-in app implemented with the ARA SDK C++ library, SDK model objects, audio readers, and archives
 
 ## Current Sample Scope
 
@@ -37,6 +37,24 @@ The remaining example milestones are tracked in
 [`docs/SAMPLE_HOST_PLAN.md`](docs/SAMPLE_HOST_PLAN.md).
 
 ## Local Development
+
+Initialize the pinned ARA SDK 2.3.0 and its nested submodules:
+
+```sh
+git submodule update --init --recursive
+```
+
+The modules build for arm64-v8a and x86_64. See
+[`docs/ARA.md`](docs/ARA.md) for ARAAAP app integration, CMake dependencies,
+threading, and native SDK tests. The Prefab package exports the upstream API
+header; plug-ins using the SDK C++ helpers also link `ARA_PlugIn_Library`.
+
+Install both sample apps from the same build. Updating only the plug-in leaves
+an older host sending the incompatible `/ara/v1` protocol:
+
+```sh
+./gradlew :samples:aaparahostsample:installDebug :samples:aaparapluginsample:installDebug
+```
 
 To use the current `../aap-core` checkout, enable the included build explicitly:
 
@@ -90,10 +108,12 @@ pre/post-content-change sample-read verification on a separate plugin instance.
 Native operations run serially off the UI thread; editing is paused while they run.
 Reverse notifications enqueue work on the host; archives are fetched after the
 callback returns. Host restoration never echoes a plugin-originated notification.
-The experimental AAP binding now includes capability-negotiated content-update
-callbacks for sources, modifications, regions and documents, and compact opaque
-modification archives (up to 4 KiB). These archives are an AAP API, not a complete
-implementation of the upstream ARA archive-controller interfaces.
+The samples now use the upstream SDK model-update and archiving interfaces.
+The host polls `notifyModelUpdates()` for queued plug-in edits. Archives use SDK
+object filters and persistent-ID remapping, transferred in chunks without the
+previous 4 KiB total limit. The incompatible SDK-backed transport is `/ara/v2`;
+the sample SDK archive reader also imports the previous `gain-v1` sample state,
+so saved projects retain their initial arrangement and gain edits after updating.
 
 This is a document-model editor: sources are generated stereo tones with a
 60-second source length. File import, audible timeline playback and time stretching

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.5.1)
 
-project(aap_ara_plugin_sample LANGUAGES CXX)
+project(aap_ara_plugin_sample LANGUAGES C CXX)
+
+include("${CMAKE_CURRENT_LIST_DIR}/../../../../../cmake/ARASDK.cmake")
 
 find_package(androidaudioplugin REQUIRED CONFIG)
 find_package(androidaudioplugin-ara REQUIRED CONFIG)
@@ -13,6 +15,7 @@ target_compile_options(aap-ara-plugin-sample
 )
 
 target_link_libraries(aap-ara-plugin-sample
+    ARA_PlugIn_Library
     android
     log
     androidaudioplugin::androidaudioplugin
@@ -24,6 +27,7 @@ add_library(aap-ara-host-sample SHARED
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../../aaparahostsample/src/main/cpp/aap-ara-host-sample.cpp)
 target_compile_features(aap-ara-host-sample PRIVATE cxx_std_17)
 target_link_libraries(aap-ara-host-sample
+    ARA_Host_Library
     android log
     androidaudioplugin::androidaudioplugin
     androidaudioplugin-ara::androidaudioplugin-ara)

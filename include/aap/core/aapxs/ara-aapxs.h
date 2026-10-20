@@ -2,7 +2,7 @@
 #define AAP_CORE_ARA_AAPXS_H
 
 #include "aap/core/aapxs/typed-aapxs.h"
-#include "aap/ext/ara.h"
+#include "aap/ara/internal/wire.h"
 
 // plugin extension opcodes
 const int32_t OPCODE_ARA_GET_FACTORY_CAPABILITY = 1;
@@ -32,10 +32,13 @@ const int32_t OPCODE_ARA_STORE_MODIFICATION_STATE = 24;
 const int32_t OPCODE_ARA_RESTORE_MODIFICATION_STATE = 25;
 const int32_t OPCODE_ARA_NOTIFY_SELECTION = 26;
 
+const int32_t OPCODE_ARA_SDK_COMMAND = 27;
+
 // host extension opcodes
 const int32_t OPCODE_ARA_GET_HOST_CAPABILITY = -1;
 const int32_t OPCODE_ARA_READ_AUDIO_SOURCE_SAMPLES = -2;
 const int32_t OPCODE_ARA_NOTIFY_CONTENT_CHANGED = -3;
+const int32_t OPCODE_ARA_HOST_SDK_COMMAND = -4;
 
 struct aap_ara_archive_wire_t {
     int64_t modification_id;
@@ -81,6 +84,7 @@ typedef struct aap_ara_musical_context_properties_wire_t {
     char name[AAP_ARA_MAX_NAME_CHARS];
     char persistent_id[AAP_ARA_MAX_PERSISTENT_ID_CHARS];
     aap_ara_optional_color_wire_t color;
+    int32_t order_index;
 } aap_ara_musical_context_properties_wire_t;
 
 typedef struct aap_ara_region_sequence_properties_wire_t {
@@ -99,6 +103,9 @@ typedef struct aap_ara_audio_source_properties_wire_t {
     int32_t channel_count;
     bool merits_64_bit_samples;
     char channel_layout_tag[AAP_ARA_MAX_CHANNEL_LAYOUT_TAG_CHARS];
+    int32_t channel_arrangement_type;
+    uint32_t channel_arrangement_size;
+    alignas(8) uint8_t channel_arrangement[4096];
 } aap_ara_audio_source_properties_wire_t;
 
 typedef struct aap_ara_audio_modification_properties_wire_t {
@@ -261,6 +268,9 @@ namespace aap::xs {
             return selection && ((AraClientAAPXS*) ext->aapxs_context)->notifySelection(*selection);
         }
 
+        static bool staticSDKCommand(aap_ara_extension_t* ext, AndroidAudioPlugin*, void* data, uint32_t size) {
+            return ((AraClientAAPXS*) ext->aapxs_context)->sdkCommand(data, size);
+        }
         aap_ara_extension_t as_plugin_extension {
                 this,
                 staticGetFactoryCapability,
@@ -288,18 +298,19 @@ namespace aap::xs {
                 staticDestroyPlaybackRegion,
                 staticStoreModificationState,
                 staticRestoreModificationState,
-                staticNotifySelection
+                staticNotifySelection,
+                staticSDKCommand
         };
 
-        // Synchronously invokes a void model-edit command and logs any failure/timeout. The
-        // aap_ara_extension_t functions return void, so the error cannot be propagated further;
-        // logging is the only in-API way to surface it.
+        // V2 control edits acknowledge SDK dispatch success. Transport errors
+        // propagate to the host application instead of silently losing edits.
         void invokeVoidEdit(int32_t opcode, const void* payload, size_t payloadSize);
 
     public:
         AraClientAAPXS(AAPXSInitiatorInstance* initiatorInstance, AAPXSSerializationContext* serialization)
                 : TypedAAPXS(AAP_ARA_EXTENSION_URI, initiatorInstance, serialization) {}
 
+        bool sdkCommand(void* data, uint32_t size);
         void getFactoryCapability(aap_ara_factory_capability_t& destination);
         void beginModelUpdate(uint32_t flags);
         void endModelUpdate();
@@ -340,7 +351,10 @@ namespace aap::xs {
         static void staticNotifyContentChanged(aap_ara_host_extension_t* ext, AndroidAudioPluginHost*, const aap_ara_content_update_t* update) {
             if (update) ((AraServiceAAPXS*) ext->aapxs_context)->notifyContentChanged(*update);
         }
-        aap_ara_host_extension_t as_host_extension{this, staticGetHostCapability, staticReadAudioSourceSamples, staticNotifyContentChanged};
+        static bool staticSDKCommand(aap_ara_host_extension_t* ext, AndroidAudioPluginHost*, void* data, uint32_t size) {
+            return ((AraServiceAAPXS*) ext->aapxs_context)->sdkCommand(data, size);
+        }
+        aap_ara_host_extension_t as_host_extension{this, staticGetHostCapability, staticReadAudioSourceSamples, staticNotifyContentChanged, staticSDKCommand};
         // The samples of the last readAudioSourceSamples(); valid until the next call.
         std::vector<uint8_t> read_samples{};
 
@@ -348,6 +362,7 @@ namespace aap::xs {
         AraServiceAAPXS(AAPXSInitiatorInstance* initiatorInstance, AAPXSSerializationContext* serialization)
                 : TypedAAPXS(AAP_ARA_EXTENSION_URI, initiatorInstance, serialization) {}
 
+        bool sdkCommand(void* data, uint32_t size);
         void getHostCapability(aap_ara_host_capability_t& destination);
         void readAudioSourceSamples(aap_ara_audio_source_id_t audioSourceId, const aap_ara_audio_source_sample_range_t* sampleRange, aap_ara_audio_source_samples_buffer_t* destination);
         void notifyContentChanged(const aap_ara_content_update_t& update);
