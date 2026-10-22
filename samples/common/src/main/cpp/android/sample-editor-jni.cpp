@@ -1,6 +1,8 @@
 #include <jni.h>
 #include <exception>
 #include "sample-editor.h"
+#include "sample-project.h"
+#include "aap/ara/araaap.hpp"
 #include "aap/core/host/plugin-host.h"
 #include "aap/ara/registry.h"
 #include "aap/core/aapxs/ara-aapxs.h"
@@ -127,8 +129,22 @@ Java_org_androidaudioplugin_arasample_SampleEditorNative_notifyEditorSelection(
     if (uint64_t(env->GetArrayLength(clipIds)) + env->GetArrayLength(trackIds) >
         (ARA_SHARED_MEMORY_SIZE - sizeof(aap_ara_view_selection_wire_t)) / sizeof(int64_t))
         return env->NewStringUTF("Selection exceeds transport capacity");
-    return env->NewStringUTF(sample_editor::notifyEditorSelection(intArray(env, clipIds),
-            intArray(env, trackIds), hasRange, start, duration).c_str());
+    std::vector<ARA::ARAPlaybackRegionRef> regions;
+    std::vector<ARA::ARARegionSequenceRef> sequences;
+    for (auto id : intArray(env, clipIds)) {
+        auto ref = sample_editor::playbackRegionRef(aap::ara::hostRef<ARA::ARAPlaybackRegionHostRef>(id));
+        if (!ref) return env->NewStringUTF("Unknown selected clip");
+        regions.push_back(ref);
+    }
+    for (auto id : intArray(env, trackIds)) {
+        auto ref = sample_editor::regionSequenceRef(aap::ara::hostRef<ARA::ARARegionSequenceHostRef>(id));
+        if (!ref) return env->NewStringUTF("Unknown selected track");
+        sequences.push_back(ref);
+    }
+    ARA::ARAContentTimeRange range{start, duration};
+    ARA::ARAViewSelection selection{sizeof(selection), regions.size(), regions.data(),
+            sequences.size(), sequences.data(), hasRange ? &range : nullptr};
+    return env->NewStringUTF(sample_editor::notifyEditorSelection(selection).c_str());
 }
 
 extern "C" JNIEXPORT jobjectArray JNICALL
@@ -159,13 +175,38 @@ Java_org_androidaudioplugin_arasample_SampleEditorNative_syncEditor(
     auto tids = intArray(env, trackIds), ids = intArray(env, clipIds), parents = intArray(env, clipTracks);
     std::vector<double> v(size_t(nc) * 5);
     env->GetDoubleArrayRegion(values, 0, v.size(), v.data());
-    std::vector<sample_editor::Track> tracks;
-    std::vector<sample_editor::Clip> clips;
-    for (int i = 0; i < nt; ++i) tracks.push_back({tids[i], stringAt(env, trackNames, i)});
-    for (int i = 0; i < nc; ++i)
-        clips.push_back({ids[i], parents[i], stringAt(env, clipNames, i),
-                v[i*5], v[i*5+1], v[i*5+2], v[i*5+3], v[i*5+4], stringAt(env, pluginStates, i)});
-    return env->NewStringUTF(sample_editor::syncEditor(jstringToStdString(env, title), tracks, clips).c_str());
+    // Own UTF-8 strings until all borrowed SDK property pointers have been used.
+    std::vector<std::string> trackNamesData, clipNamesData, persistentIDs;
+    trackNamesData.reserve(nt);
+    clipNamesData.reserve(nc);
+    persistentIDs.reserve(nc);
+    for (int i = 0; i < nt; ++i) trackNamesData.push_back(stringAt(env, trackNames, i));
+    for (int i = 0; i < nc; ++i) {
+        clipNamesData.push_back(stringAt(env, clipNames, i));
+        persistentIDs.push_back("clip-" + std::to_string(ids[i]));
+    }
+    using namespace ARA;
+    using aap::ara::hostRef;
+    std::vector<sample_project::RegionSequence> sequences;
+    std::vector<sample_project::PlaybackRegion> regions;
+    for (int i = 0; i < nt; ++i)
+        sequences.push_back({hostRef<ARARegionSequenceHostRef>(tids[i]),
+                {sizeof(ARARegionSequenceProperties), trackNamesData[i].c_str(), i, nullptr, nullptr}});
+    auto rate = sample_editor::sampleRate();
+    for (int i = 0; i < nc; ++i) {
+        const auto* name = clipNamesData[i].c_str();
+        const auto* persistentID = persistentIDs[i].c_str();
+        ARAAudioSourceProperties source{sizeof(source), name, persistentID, ARASampleCount(rate * 60), rate,
+                2, kARAFalse, kARAChannelArrangementUndefined, nullptr};
+        ARAAudioModificationProperties modification{sizeof(modification), name, persistentID};
+        ARAPlaybackRegionProperties region{sizeof(region), kARAPlaybackTransformationNoChanges,
+                v[i*5+1], v[i*5+2], v[i*5], v[i*5+2], nullptr, nullptr, name, nullptr};
+        regions.push_back({hostRef<ARAPlaybackRegionHostRef>(ids[i]), hostRef<ARARegionSequenceHostRef>(parents[i]),
+                source, modification, region, v[i*5+3], v[i*5+4], stringAt(env, pluginStates, i)});
+    }
+    auto name = jstringToStdString(env, title);
+    ARADocumentProperties document{sizeof(document), name.c_str()};
+    return env->NewStringUTF(sample_project::sync(document, sequences, regions).c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL

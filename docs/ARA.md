@@ -61,7 +61,11 @@ A plug-in using the C++ library can implement these with
 The sample implements `SampleDocumentController`, `SampleSource`, and
 `SampleModification` using the SDK's model classes. It reads audio through
 `ARA::PlugIn::HostAudioReader` and implements the SDK's archive delegate hooks.
-Its Compose snapshot is a display cache derived from SDK objects.
+Its Compose JSON is serialized directly from the SDK's `Document`,
+`RegionSequence`, `AudioSource`, `AudioModification`, `PlaybackRegion`, and
+`ViewSelection`. There is no parallel sample entity graph. Native editors can
+read the same document through the sample's synchronized `withDocument()` callback;
+they do not need to adopt the Compose JSON format.
 
 Construct `aap::ara::PlugIn` with the AAP instance, its host, and this companion
 extension. Delegate AAP `get_extension` to `adapter.getExtension(uri)`. This
@@ -196,7 +200,19 @@ Set `AAP_CORE_INCLUDE_DIR` when aap-core is not in the sibling checkout. The nat
 suite uses the real SDK with debug API validation enabled and covers factory
 metadata, model-thread affinity, host tempo content, audio and note readers,
 roles/selection, cloning, archives larger than 4 KiB, ID remapping, and queued
-notifications. Android instrumentation tests exercise the sample editor and
+notifications.
+
+`araaap-existing-sdk-code` compiles the upstream `ARATestDocumentController`, audio
+source, renderer, analysis, and persistence sources without edits. One host workflow,
+written only against the SDK, runs first with a direct ARA binding and then with
+ARAAAP. Both paths exercise model edits, audio callbacks, note analysis/readers,
+and standard SDK archive callbacks. This checks reuse of existing ARA code rather
+than only controllers written specifically for AAP. `araaap-sample-sdk-model`
+compiles the actual sample plugin without JNI and checks that native document
+access, Compose snapshots, selection deletion, and gain notifications all use the
+same SDK objects.
+
+Android instrumentation tests exercise the sample editor and
 AAPXS/Binder path. Install the plug-in APK before running the host's tests.
 
 Verified on 2026-10-20: both samples and the AAR build in Debug and Release for

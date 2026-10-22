@@ -3,6 +3,8 @@
 #include <memory>
 #include <aap/ara/araaap.hpp>
 #include <ARA_Library/PlugIn/ARAPlug.h>
+#include <ARA_Library/Debug/ARAContentLogger.h>
+#include <iomanip>
 #include <aap/ext/plugin-info.h>
 #include <algorithm>
 #include <array>
@@ -13,20 +15,19 @@
 #include <map>
 #include <mutex>
 #include <sstream>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#include "aap/unstable/logging.h"
-
-#define LOG_TAG "AAP.ARA.PluginSample"
 
 struct SamplePluginContext;
 
 namespace {
 std::map<uint64_t, std::shared_ptr<SamplePluginContext>> editable_contexts;
-struct PublishedModel { std::mutex mutex; std::string json = "{}"; uint64_t revision = 0; };
+struct PublishedModel {
+    std::mutex mutex;
+    std::string json = "{}", selection;
+    uint64_t revision = 0;
+};
 std::mutex snapshots_mutex;
 uint64_t next_snapshot_token = 1;
 std::map<uint64_t, std::shared_ptr<PublishedModel>> snapshots;
@@ -49,52 +50,6 @@ std::string json_string(const std::string& text) {
 using namespace ARA;
 using namespace ARA::PlugIn;
 using aap::ara::hostID;
-using aap::ara::hostRef;
-
-struct NamedEntity {
-    std::string name;
-    std::string persistent_id;
-};
-
-struct MusicalContextEntity : public NamedEntity {
-    bool has_color{};
-    ARAColor color{};
-};
-
-struct RegionSequenceEntity : public MusicalContextEntity {
-    int32_t order_index{};
-    int64_t musical_context_id{};
-};
-
-struct AudioSourceEntity : public NamedEntity {
-    double rms = 0.0;
-    ARASampleCount sample_count{};
-    ARASampleRate sample_rate{};
-    int32_t channel_count{};
-    bool merits_64_bit_samples{};
-    std::string channel_layout_tag;
-    bool samples_access_enabled{};
-    ARASamplePosition changed_start_sample{};
-    ARASampleCount changed_sample_count{};
-};
-
-struct AudioModificationEntity : public NamedEntity {
-    double gain = 1.0;
-    int64_t audio_source_id{};
-};
-
-struct PlaybackRegionEntity {
-    uint32_t transformation_flags{};
-    ARATimePosition start_in_modification_time{};
-    ARATimeDuration duration_in_modification_time{};
-    ARATimePosition start_in_playback_time{};
-    ARATimeDuration duration_in_playback_time{};
-    int64_t region_sequence_id{};
-    std::string name;
-    bool has_color{};
-    ARAColor color{};
-    int64_t audio_modification_id{};
-};
 
 class SampleDocumentController;
 
@@ -104,15 +59,12 @@ struct SamplePluginContext {
     std::recursive_mutex model_mutex;
     bool released = false;
     bool reverse_updates_supported = false;
-    int64_t analyzed_source = 0;
+    ARAAudioSourceHostRef analyzed_source{};
     std::atomic<double> diagnostic_gain{1.0};
     AndroidAudioPluginHost host;
     std::string plugin_id;
     std::array<int32_t, 2> audio_output_ports{0, 1};
     bool model_update_active{};
-    uint32_t last_model_update_flags{};
-    bool sample_access_enabled{};
-    bool host_supports_float32{};
     std::array<float, 4> pre_change_output_l{};
     std::array<float, 4> pre_change_output_r{};
     std::array<float, 4> post_change_output_l{};
@@ -122,17 +74,6 @@ struct SamplePluginContext {
     std::shared_ptr<PublishedModel> published = std::make_shared<PublishedModel>();
     uint64_t content_changes = 0;
     uint64_t selection_changes = 0;
-    int64_t selection_document_id{};
-    std::vector<int64_t> selected_regions, selected_sequences;
-    bool selection_has_time_range{};
-    double selection_start{}, selection_duration{};
-    std::map<int64_t, NamedEntity> documents;
-    std::map<int64_t, MusicalContextEntity> musical_contexts;
-    std::map<int64_t, RegionSequenceEntity> region_sequences;
-    std::map<int64_t, AudioSourceEntity> audio_sources;
-    std::map<int64_t, AudioModificationEntity> audio_modifications;
-    std::map<int64_t, PlaybackRegionEntity> playback_regions;
-
     explicit SamplePluginContext(AndroidAudioPluginHost* host_, const char* id) : host(*host_), plugin_id(id ? id : "") {}
 };
 
@@ -140,87 +81,13 @@ static SamplePluginContext* get_context(AndroidAudioPlugin* plugin) {
     return static_cast<std::shared_ptr<SamplePluginContext>*>(plugin->plugin_specific)->get();
 }
 
-// Publish only completed transactions. The UI reads this immutable copy and
-// never touches the live ARA maps or holds a lock across reverse host callbacks.
-static void publish_model(SamplePluginContext* context, bool contentChanged = true) {
-    const auto old_regions = context->selected_regions, old_sequences = context->selected_sequences;
-    context->selected_regions.erase(std::remove_if(context->selected_regions.begin(), context->selected_regions.end(),
-        [context](int64_t id) { return !context->playback_regions.count(id); }), context->selected_regions.end());
-    context->selected_sequences.erase(std::remove_if(context->selected_sequences.begin(), context->selected_sequences.end(),
-        [context](int64_t id) { return !context->region_sequences.count(id); }), context->selected_sequences.end());
-    if (!old_sequences.empty() && context->selected_sequences.empty())
-        context->selection_has_time_range = false;
-    const bool removed_document = context->selection_document_id && !context->documents.count(context->selection_document_id);
-    if (removed_document) {
-        context->selection_document_id = 0;
-        context->selection_has_time_range = false;
-    }
-    if (old_regions != context->selected_regions || old_sequences != context->selected_sequences || removed_document)
-        ++context->selection_changes;
-    auto& snapshot = *context->published;
-    std::lock_guard<std::mutex> lock(snapshot.mutex);
-    std::ostringstream out;
-    out.precision(17);
-    if (contentChanged)
-        ++snapshot.revision;
-    out << "{\"canEdit\":" << (context->reverse_updates_supported ? "true" : "false") << ",\"revision\":" << snapshot.revision << ",\"contentChanges\":" << context->content_changes;
-    out << ",\"selectionChanges\":" << context->selection_changes << ",\"selection\":{\"clips\":[";
-    for (size_t i = 0; i < context->selected_regions.size(); ++i) {
-        if (i) out << ',';
-        out << context->selected_regions[i];
-    }
-    out << "],\"tracks\":[";
-    for (size_t i = 0; i < context->selected_sequences.size(); ++i) {
-        if (i) out << ',';
-        out << context->selected_sequences[i];
-    }
-    out << "],\"range\":";
-    if (context->selection_has_time_range)
-        out << "{\"start\":" << context->selection_start << ",\"duration\":" << context->selection_duration << '}';
-    else
-        out << "null";
-    out << '}';
-    out << ",\"title\":" << json_string(context->documents.empty() ? "No ARA document" : context->documents.begin()->second.name);
-    out << ",\"tracks\":[";
-    bool comma = false;
-    for (auto& [id, track] : context->region_sequences) {
-        if (comma) out << ',';
-        comma = true;
-        out << "{\"id\":" << id << ",\"name\":" << json_string(track.name) << ",\"order\":" << track.order_index << '}';
-    }
-    out << "],\"clips\":[";
-    comma = false;
-    for (auto& [id, clip] : context->playback_regions) {
-        if (comma) out << ',';
-        comma = true;
-        auto modification = context->audio_modifications.find(clip.audio_modification_id);
-        int source = modification == context->audio_modifications.end() ? 0 : modification->second.audio_source_id;
-        out << "{\"id\":" << id << ",\"track\":" << clip.region_sequence_id << ",\"name\":" << json_string(clip.name)
-            << ",\"start\":" << clip.start_in_playback_time << ",\"offset\":" << clip.start_in_modification_time
-            << ",\"duration\":" << clip.duration_in_playback_time << ",\"sourceId\":" << source
-            << ",\"modificationId\":" << clip.audio_modification_id
-            << ",\"modificationGain\":" << (modification == context->audio_modifications.end() ? 1.0 : modification->second.gain)
-            << ",\"processedRms\":" << (context->audio_sources.count(source) && modification != context->audio_modifications.end()
-                ? context->audio_sources.at(source).rms * modification->second.gain : 0.0) << '}';
-    }
-    out << "],\"sources\":[";
-    comma = false;
-    for (auto& [id, source] : context->audio_sources) {
-        if (comma) out << ',';
-        comma = true;
-        out << "{\"id\":" << id << ",\"name\":" << json_string(source.name) << ",\"sampleCount\":" << source.sample_count
-            << ",\"sampleRate\":" << source.sample_rate << ",\"access\":" << (source.samples_access_enabled ? "true" : "false")
-            << ",\"changedStart\":" << source.changed_start_sample << ",\"changedCount\":" << source.changed_sample_count << '}';
-    }
-    std::lock_guard<std::mutex> analysis_lock(context->analysis_mutex);
-    out << "],\"analysis\":" << json_string(context->analysis_summary) << '}';
-    snapshot.json = out.str();
-}
-
-
 struct SampleSource : AudioSource {
     using AudioSource::AudioSource;
     double rms{};
+    int algorithm{};
+    bool contentAvailable{};
+    ARAContentGrade contentGrade = kARAContentGradeDetected;
+    std::vector<ARAContentNote> notes;
     ARASamplePosition changedStart{};
     ARASampleCount changedCount{};
 };
@@ -229,45 +96,105 @@ struct SampleModification : AudioModification {
     SampleModification(AudioSource* source, ARAAudioModificationHostRef host, const AudioModification* clone) noexcept
         : AudioModification(source, host, clone), gain(clone ? static_cast<const SampleModification*>(clone)->gain : 1.0) {}
 };
+// Readers own their events, including transformed playback-region coordinates.
+class SampleNoteReader : public ARA::PlugIn::ContentReader {
+public:
+    std::vector<ARAContentNote> notes;
+    ARAInt32 getEventCount() noexcept override { return static_cast<ARAInt32>(notes.size()); }
+    const void* getDataForEvent(ARAInt32 index) noexcept override {
+        return index >= 0 && static_cast<size_t>(index) < notes.size() ? &notes[index] : nullptr;
+    }
+};
 class SampleView;
 class SampleDocumentController : public DocumentController {
 public:
     std::weak_ptr<SamplePluginContext> companion;
     explicit SampleDocumentController(const PlugInEntry* entry, const ARADocumentControllerHostInstance* host) noexcept : DocumentController(entry, host) {}
-    void sync(bool changed = true) noexcept {
-        auto c = companion.lock(); if (!c) return;
-        c->documents.clear(); c->region_sequences.clear(); c->audio_sources.clear(); c->audio_modifications.clear(); c->playback_regions.clear();
-        auto* document = getDocument();
-        if (document) {
-            c->documents[1].name = text(document->getName());
-            for (auto* track : document->getRegionSequences()) {
-                auto& t = c->region_sequences[hostID(track->getHostRef())]; t.name = text(track->getName()); t.order_index = track->getOrderIndex();
-                for (auto* region : track->getPlaybackRegions()) {
-                    auto& r = c->playback_regions[hostID(region->getHostRef())]; r.name = text(region->getName());
-                    r.region_sequence_id = hostID(track->getHostRef()); r.audio_modification_id = hostID(region->getAudioModification()->getHostRef());
-                    r.start_in_modification_time = region->getStartInAudioModificationTime(); r.duration_in_modification_time = region->getDurationInAudioModificationTime();
-                    r.start_in_playback_time = region->getStartInPlaybackTime(); r.duration_in_playback_time = region->getDurationInPlaybackTime();
-                }
-            }
-            for (auto* source : document->getAudioSources<SampleSource>()) {
-                auto& v = c->audio_sources[hostID(source->getHostRef())]; v.name = text(source->getName()); v.rms = source->rms;
-                v.sample_count = source->getSampleCount(); v.sample_rate = source->getSampleRate(); v.channel_count = source->getChannelCount();
-                v.samples_access_enabled = source->isSampleAccessEnabled(); v.changed_start_sample = source->changedStart; v.changed_sample_count = source->changedCount;
-                for (auto* modification : source->getAudioModifications<SampleModification>()) {
-                    auto& m = c->audio_modifications[hostID(modification->getHostRef())]; m.name = text(modification->getName());
-                    m.audio_source_id = hostID(source->getHostRef()); m.gain = modification->gain;
-                    if (c->analyzed_source == m.audio_source_id) c->diagnostic_gain.store(m.gain);
-                }
-            }
-        }
+    // The SDK document is the only model. JSON is a read-only projection for
+    // Compose; an existing native editor can access the same SDK document.
+    void sync(bool changed = true, bool documentDestroyed = false, bool selectionNotified = false) noexcept {
+        auto c = companion.lock();
+        if (!c) return;
+        auto* document = documentDestroyed ? nullptr : getDocument();
+        auto* view = c->binding->getEditorView();
+        const auto* selection = document && view ? &view->getViewSelection() : nullptr;
         c->reverse_updates_supported = getHostModelUpdateController() != nullptr;
-        publish_model(c.get(), changed);
+        auto& snapshot = *c->published;
+        std::lock_guard<std::mutex> lock(snapshot.mutex);
+        std::ostringstream selected;
+        selected.precision(17);
+        selected << "{\"clips\":[";
+        bool comma = false;
+        if (selection) for (auto* region : selection->getPlaybackRegions()) {
+            if (comma) selected << ',';
+            comma = true;
+            selected << hostID(region->getHostRef());
+        }
+        selected << "],\"tracks\":[";
+        comma = false;
+        if (selection) for (auto* sequence : selection->getRegionSequences()) {
+            if (comma) selected << ',';
+            comma = true;
+            selected << hostID(sequence->getHostRef());
+        }
+        selected << "],\"range\":";
+        const ARAContentTimeRange* range = selection ? selection->getTimeRange() : nullptr;
+        if (range) selected << "{\"start\":" << range->start << ",\"duration\":" << range->duration << '}';
+        else selected << "null";
+        selected << '}';
+        if (selectionNotified || (!snapshot.selection.empty() && snapshot.selection != selected.str()))
+            ++c->selection_changes;
+        snapshot.selection = selected.str();
+        if (changed) ++snapshot.revision;
+        std::ostringstream out;
+        out.precision(17);
+        out << "{\"canEdit\":" << (c->reverse_updates_supported ? "true" : "false")
+            << ",\"revision\":" << snapshot.revision << ",\"contentChanges\":" << c->content_changes
+            << ",\"selectionChanges\":" << c->selection_changes << ",\"selection\":" << snapshot.selection
+            << ",\"title\":" << json_string(document ? text(document->getName()) : "No ARA document");
+        out << ",\"tracks\":[";
+        comma = false;
+        if (document) for (auto* sequence : document->getRegionSequences()) {
+            if (comma) out << ',';
+            comma = true;
+            out << "{\"id\":" << hostID(sequence->getHostRef()) << ",\"name\":" << json_string(text(sequence->getName()))
+                << ",\"order\":" << sequence->getOrderIndex() << '}';
+        }
+        out << "],\"clips\":[";
+        comma = false;
+        if (document) for (auto* sequence : document->getRegionSequences()) for (auto* region : sequence->getPlaybackRegions()) {
+            if (comma) out << ',';
+            comma = true;
+            auto* modification = region->getAudioModification<SampleModification>();
+            auto* source = modification->getAudioSource<SampleSource>();
+            out << "{\"id\":" << hostID(region->getHostRef()) << ",\"track\":" << hostID(sequence->getHostRef())
+                << ",\"name\":" << json_string(text(region->getName()))
+                << ",\"start\":" << region->getStartInPlaybackTime() << ",\"offset\":" << region->getStartInAudioModificationTime()
+                << ",\"duration\":" << region->getDurationInPlaybackTime() << ",\"sourceId\":" << hostID(source->getHostRef())
+                << ",\"modificationId\":" << hostID(modification->getHostRef()) << ",\"modificationGain\":" << modification->gain
+                << ",\"processedRms\":" << source->rms * modification->gain << '}';
+        }
+        out << "],\"sources\":[";
+        comma = false;
+        if (document) for (auto* source : document->getAudioSources<SampleSource>()) {
+            if (comma) out << ',';
+            comma = true;
+            out << "{\"id\":" << hostID(source->getHostRef()) << ",\"name\":" << json_string(text(source->getName()))
+                << ",\"sampleCount\":" << source->getSampleCount() << ",\"sampleRate\":" << source->getSampleRate()
+                << ",\"access\":" << (source->isSampleAccessEnabled() ? "true" : "false")
+                << ",\"changedStart\":" << source->changedStart << ",\"changedCount\":" << source->changedCount << '}';
+            if (source->getHostRef() == c->analyzed_source && !source->getAudioModifications().empty())
+                c->diagnostic_gain.store(source->getAudioModifications<SampleModification>().front()->gain);
+        }
+        std::lock_guard<std::mutex> analysis_lock(c->analysis_mutex);
+        out << "],\"analysis\":" << json_string(c->analysis_summary) << '}';
+        snapshot.json = out.str();
     }
     static const char* text(const OptionalProperty<ARAUtf8String>& value) { return value ? static_cast<const char*>(value) : ""; }
-    bool setGain(int64_t id, double gain) {
+    bool setGain(ARAAudioModificationHostRef ref, double gain) {
         if (!getDocument()) return false;
         for (auto* source : getDocument()->getAudioSources()) for (auto* m : source->getAudioModifications<SampleModification>()) {
-            if (hostID(m->getHostRef()) != id) continue;
+            if (m->getHostRef() != ref) continue;
             if (m->gain == gain) return true;
             m->gain = gain;
             // The SDK queues this until the host calls notifyModelUpdates().
@@ -281,23 +208,95 @@ protected:
     void willBeginEditing() noexcept override { if (auto c = companion.lock()) c->model_update_active = true; }
     void didEndEditing() noexcept override { if (auto c = companion.lock()) c->model_update_active = false; sync(); }
     void willDestroyDocument(Document*) noexcept override {
-        if (auto c = companion.lock()) { c->documents.clear(); c->region_sequences.clear(); c->audio_sources.clear(); c->audio_modifications.clear(); c->playback_regions.clear(); publish_model(c.get()); }
+        sync(true, true);
     }
     AudioSource* doCreateAudioSource(Document* doc, ARAAudioSourceHostRef host) noexcept override { return new SampleSource(doc, host); }
     AudioModification* doCreateAudioModification(AudioSource* source, ARAAudioModificationHostRef host, const AudioModification* clone) noexcept override { return new SampleModification(source, host, clone); }
-    void doUpdateMusicalContextContent(MusicalContext*, const ARAContentTimeRange*, ContentUpdateScopes) noexcept override {}
-    void doUpdateAudioSourceContent(AudioSource* source, const ARAContentTimeRange* range, ContentUpdateScopes) noexcept override {
+    void doUpdateMusicalContextContent(MusicalContext* context, const ARAContentTimeRange* range, ContentUpdateScopes scopes) noexcept override {
+        if (getHostContentAccessController())
+            ARA::ContentLogger::logUpdatedContent(*getHostContentAccessController(), context->getHostRef(), range, scopes);
+    }
+    void doUpdateAudioSourceContent(AudioSource* source, const ARAContentTimeRange* range, ContentUpdateScopes scopes) noexcept override {
         auto* s = static_cast<SampleSource*>(source);
+        if (scopes.affectNotes() || scopes.affectSamples()) { s->contentAvailable = false; s->notes.clear(); }
         s->changedStart = range ? std::llround(range->start * s->getSampleRate()) : 0;
         s->changedCount = range ? std::llround(range->duration * s->getSampleRate()) : s->getSampleCount();
         if (auto c = companion.lock()) ++c->content_changes;
         if (s->isSampleAccessEnabled()) analyze(s, true);
+        copyHostNotes(s);
+    }
+    void willUpdateAudioSourceProperties(AudioSource* source, PropertiesPtr<ARAAudioSourceProperties> properties) noexcept override {
+        if (source->getSampleCount() != properties->sampleCount || source->getSampleRate() != properties->sampleRate ||
+                source->getChannelCount() != properties->channelCount) {
+            auto* s = static_cast<SampleSource*>(source); s->contentAvailable = false; s->notes.clear();
+        }
     }
     void willEnableAudioSourceSamplesAccess(AudioSource*, bool) noexcept override {}
-    void didEnableAudioSourceSamplesAccess(AudioSource* source, bool enabled) noexcept override { if (enabled) analyze(static_cast<SampleSource*>(source), false); sync(); }
+    void didEnableAudioSourceSamplesAccess(AudioSource* source, bool enabled) noexcept override {
+        if (enabled) { analyze(static_cast<SampleSource*>(source), false, true); copyHostNotes(static_cast<SampleSource*>(source)); }
+        sync();
+    }
+    bool doIsAudioSourceContentAvailable(const AudioSource* source, ARAContentType type) noexcept override {
+        return type == kARAContentTypeNotes && static_cast<const SampleSource*>(source)->contentAvailable;
+    }
+    ARAContentGrade doGetAudioSourceContentGrade(const AudioSource* source, ARAContentType) noexcept override {
+        return static_cast<const SampleSource*>(source)->contentGrade;
+    }
+    ARA::PlugIn::ContentReader* doCreateAudioSourceContentReader(AudioSource* source, ARAContentType, const ARAContentTimeRange* range) noexcept override {
+        return noteReader(static_cast<SampleSource*>(source), 1, nullptr, range);
+    }
+    bool doIsAudioModificationContentAvailable(const AudioModification* m, ARAContentType type) noexcept override {
+        return doIsAudioSourceContentAvailable(m->getAudioSource(), type);
+    }
+    ARAContentGrade doGetAudioModificationContentGrade(const AudioModification* m, ARAContentType type) noexcept override {
+        return doGetAudioSourceContentGrade(m->getAudioSource(), type);
+    }
+    ARA::PlugIn::ContentReader* doCreateAudioModificationContentReader(AudioModification* m, ARAContentType, const ARAContentTimeRange* range) noexcept override {
+        return noteReader(static_cast<SampleSource*>(m->getAudioSource()), static_cast<SampleModification*>(m)->gain, nullptr, range);
+    }
+    bool doIsPlaybackRegionContentAvailable(const PlaybackRegion* r, ARAContentType type) noexcept override {
+        return doIsAudioModificationContentAvailable(r->getAudioModification(), type);
+    }
+    ARAContentGrade doGetPlaybackRegionContentGrade(const PlaybackRegion* r, ARAContentType type) noexcept override {
+        return doGetAudioModificationContentGrade(r->getAudioModification(), type);
+    }
+    ARA::PlugIn::ContentReader* doCreatePlaybackRegionContentReader(PlaybackRegion* r, ARAContentType, const ARAContentTimeRange* range) noexcept override {
+        auto* m = static_cast<SampleModification*>(r->getAudioModification());
+        return noteReader(static_cast<SampleSource*>(m->getAudioSource()), m->gain, r, range);
+    }
+    bool doIsAudioSourceContentAnalysisIncomplete(const AudioSource*, ARAContentType) noexcept override { return false; }
+    void doRequestAudioSourceContentAnalysis(AudioSource* source, const std::vector<ARAContentType>&) noexcept override {
+        auto* s = static_cast<SampleSource*>(source);
+        if (s->isSampleAccessEnabled()) analyze(s, false);
+        copyHostNotes(s);
+        notifyAudioSourceContentChanged(s, ContentUpdateScopes::notesAreAffected());
+    }
+    ARAInt32 doGetProcessingAlgorithmsCount() noexcept override { return 2; }
+    const ARAProcessingAlgorithmProperties* doGetProcessingAlgorithmProperties(ARAInt32 index) noexcept override {
+        static const ARAProcessingAlgorithmProperties algorithms[]{
+            {sizeof(ARAProcessingAlgorithmProperties), "org.androidaudioplugin.ara.sample.rms", "RMS level"},
+            {sizeof(ARAProcessingAlgorithmProperties), "org.androidaudioplugin.ara.sample.peak", "Peak level"}};
+        return &algorithms[index];
+    }
+    ARAInt32 doGetProcessingAlgorithmForAudioSource(const AudioSource* source) noexcept override { return static_cast<const SampleSource*>(source)->algorithm; }
+    void doRequestProcessingAlgorithmForAudioSource(AudioSource* source, ARAInt32 index) noexcept override {
+        auto* s = static_cast<SampleSource*>(source); s->algorithm = index;
+        s->contentAvailable = false; s->notes.clear();
+        if (s->isSampleAccessEnabled()) analyze(s, false);
+        copyHostNotes(s);
+        notifyAudioSourceContentChanged(s, ContentUpdateScopes::notesAreAffected());
+    }
     bool doStoreObjectsToArchive(HostArchiveWriter* writer, const StoreObjectsFilter* filter) noexcept override {
-        std::ostringstream out; out.precision(17); out << "ARAAAP-gain-v2\n";
-        for (auto* m : filter->getAudioModificationsToStore<SampleModification>()) out << m->getPersistentID() << '\t' << m->gain << '\n';
+        std::ostringstream out; out.precision(17); out << "ARAAAP-state-v3\n";
+        for (auto* m : filter->getAudioModificationsToStore<SampleModification>())
+            out << "M " << std::quoted(m->getPersistentID()) << ' ' << m->gain << '\n';
+        for (auto* source : filter->getAudioSourcesToStore<SampleSource>()) {
+            out << "S " << std::quoted(source->getPersistentID()) << ' ' << source->algorithm << ' '
+                << int(source->contentGrade) << ' ' << source->contentAvailable << ' ' << source->notes.size() << '\n';
+            for (auto& note : source->notes)
+                out << note.frequency << ' ' << note.pitchNumber << ' ' << note.volume << ' ' << note.startPosition << ' '
+                    << note.attackDuration << ' ' << note.noteDuration << ' ' << note.signalDuration << '\n';
+        }
         auto bytes = out.str(); return writer->writeBytesToArchive(0, bytes.size(), reinterpret_cast<const ARAByte*>(bytes.data()));
     }
     bool doRestoreObjectsFromArchive(HostArchiveReader* reader, const RestoreObjectsFilter* filter) noexcept override {
@@ -322,7 +321,9 @@ protected:
                     if (filter->getAudioModificationToRestoreStateWithID(m->getPersistentID().c_str())) m->gain = gain;
             sync(); return true;
         }
-        std::istringstream in(bytes); std::string header, line; std::getline(in, header); if (header != "ARAAAP-gain-v2") return false;
+        std::istringstream in(bytes); std::string header, line; std::getline(in, header);
+        if (header == "ARAAAP-state-v3") return restoreState(in, filter);
+        if (header != "ARAAAP-gain-v2") return false;
         std::vector<std::pair<SampleModification*, double>> changes;
         while (std::getline(in, line)) {
             auto tab = line.find('\t'); if (tab == std::string::npos) return false;
@@ -336,13 +337,92 @@ protected:
     }
     EditorView* doCreateEditorView() noexcept override;
 private:
-    void analyze(SampleSource* source, bool post) noexcept {
-        auto c = companion.lock(); if (!c) return;
+    bool restoreState(std::istream& in, const RestoreObjectsFilter* filter) {
+        struct SourceChange { SampleSource* source; int algorithm, grade; bool available; std::vector<ARAContentNote> notes; };
+        std::vector<SourceChange> sources;
+        std::vector<std::pair<SampleModification*, double>> modifications;
+        // Parse and validate before applying anything, including filtered-out objects.
+        std::string tag, id;
+        while (in >> tag) {
+            if (!(in >> std::quoted(id))) return false;
+            if (tag == "M") {
+                double gain;
+                if (!(in >> gain) || !std::isfinite(gain) || gain < 0 || gain > 2) return false;
+                if (auto* m = filter->getAudioModificationToRestoreStateWithID<SampleModification>(id.c_str())) modifications.emplace_back(m, gain);
+            } else if (tag == "S") {
+                int algorithm, grade, available; size_t count;
+                if (!(in >> algorithm >> grade >> available >> count) || algorithm < 0 || algorithm >= 2 ||
+                        grade < kARAContentGradeInitial || grade > kARAContentGradeApproved || available < 0 || available > 1 || count > 1000000) return false;
+                SourceChange state{filter->getAudioSourceToRestoreStateWithID<SampleSource>(id.c_str()), algorithm, grade, available != 0, {}};
+                for (size_t i = 0; i < count; ++i) {
+                    ARAContentNote n{};
+                    if (!(in >> n.frequency >> n.pitchNumber >> n.volume >> n.startPosition >> n.attackDuration >> n.noteDuration >> n.signalDuration) ||
+                        !std::isfinite(n.frequency) || !std::isfinite(n.volume) || !std::isfinite(n.startPosition) || !std::isfinite(n.attackDuration) ||
+                        !std::isfinite(n.noteDuration) || !std::isfinite(n.signalDuration) || n.volume < 0 || n.volume > 1 ||
+                        n.attackDuration < 0 || n.noteDuration < n.attackDuration || n.signalDuration < n.noteDuration) return false;
+                    state.notes.push_back(n);
+                }
+                sources.push_back(std::move(state));
+            } else return false;
+        }
+        if (!in.eof()) return false;
+        for (auto& state : sources) if (state.source) {
+            state.source->algorithm = state.algorithm; state.source->contentGrade = ARAContentGrade(state.grade);
+            state.source->contentAvailable = state.available; state.source->notes = std::move(state.notes);
+        }
+        for (auto& change : modifications) change.first->gain = change.second;
+        sync(); return true;
+    }
+    void copyHostNotes(SampleSource* source) noexcept {
+        if (!getHostContentAccessController()) return;
+        HostContentReader<kARAContentTypeNotes> reader(source);
+        if (!reader || reader.getGrade() == kARAContentGradeInitial) return;
+        source->notes.assign(reader.begin(), reader.end());
+        source->contentGrade = reader.getGrade(); source->contentAvailable = true;
+    }
+    ARA::PlugIn::ContentReader* noteReader(const SampleSource* source, double gain, const PlaybackRegion* region, const ARAContentTimeRange* range) {
+        auto* reader = new SampleNoteReader;
+        for (auto note : source->notes) {
+            if (region) {
+                const auto sourceStart = region->getStartInAudioModificationTime();
+                const auto start = std::max(note.startPosition, sourceStart);
+                const auto end = std::min(note.startPosition + note.signalDuration, sourceStart + region->getDurationInAudioModificationTime());
+                if (end <= start) continue;
+                const auto scale = region->getDurationInPlaybackTime() / region->getDurationInAudioModificationTime();
+                const auto noteEnd = std::min(note.startPosition + note.noteDuration, end);
+                note.startPosition = region->getStartInPlaybackTime() + (start - sourceStart) * scale;
+                note.attackDuration = 0; note.noteDuration = std::max(0.0, noteEnd - start) * scale;
+                note.signalDuration = (end - start) * scale;
+            }
+            note.volume = std::clamp(float(note.volume * gain), 0.0f, 1.0f);
+            if (!range || (note.startPosition < range->start + range->duration && note.startPosition + note.signalDuration > range->start))
+                reader->notes.push_back(note);
+        }
+        return reader;
+    }
+    void analyze(SampleSource* source, bool post, bool preserveContent = false) noexcept {
+        auto c = companion.lock();
+        const auto count = std::min<ARASampleCount>(128, source->getSampleCount() - 64);
+        if (count <= 0) return;
         std::array<float, 128> left{}, right{}; void* buffers[]{left.data(), right.data()};
         HostAudioReader reader(source);
-        if (!reader.readAudioSamples(64, 128, buffers)) { std::lock_guard<std::mutex> lock(c->analysis_mutex); c->analysis_summary = "SDK audio reader failed"; return; }
-        auto metrics = [](const auto& samples) { double sum = 0; float peak = 0; for (float v : samples) { sum += double(v) * v; peak = std::max(peak, std::fabs(v)); } return std::array<float, 4>{samples[0], samples[1], float(std::sqrt(sum / samples.size())), peak}; };
-        auto l = metrics(left), r = metrics(right); source->rms = l[2]; c->analyzed_source = hostID(source->getHostRef());
+        if (!reader.readAudioSamples(64, count, buffers)) {
+            if (c) { std::lock_guard<std::mutex> lock(c->analysis_mutex); c->analysis_summary = "SDK audio reader failed"; }
+            return;
+        }
+        auto metrics = [count](const auto& samples) {
+            double sum = 0; float peak = 0;
+            for (int i = 0; i < count; ++i) { auto v = samples[i]; sum += double(v) * v; peak = std::max(peak, std::fabs(v)); }
+            return std::array<float, 4>{samples[0], samples[1], float(std::sqrt(sum / count)), peak};
+        };
+        auto l = metrics(left), r = metrics(right); source->rms = l[2];
+        const double duration = source->getSampleCount() / source->getSampleRate();
+        if (!preserveContent || !source->contentAvailable) {
+            source->notes = {{kARAInvalidFrequency, kARAInvalidPitchNumber, std::clamp(l[source->algorithm == 0 ? 2 : 3], 0.0f, 1.0f), 0, 0, duration, duration}};
+            source->contentGrade = kARAContentGradeDetected; source->contentAvailable = true;
+        }
+        if (!c) return; // ARA documents can exist before a companion instance is bound.
+        c->analyzed_source = source->getHostRef();
         std::lock_guard<std::mutex> lock(c->analysis_mutex);
         if (post) { c->post_change_output_l = l; c->post_change_output_r = r; } else { c->pre_change_output_l = l; c->pre_change_output_r = r; }
         c->analysis_summary = std::string("ARA SDK ") + (post ? "post-change" : "pre-change") + " sample read";
@@ -352,14 +432,9 @@ class SampleView : public EditorView {
 public:
     using EditorView::EditorView;
 protected:
-    void doNotifySelection(const ViewSelection* selection) noexcept override {
-        auto* dc = getDocumentController<SampleDocumentController>(); auto c = dc->companion.lock(); if (!c) return;
-        c->selected_regions.clear(); c->selected_sequences.clear();
-        for (auto* r : selection->getPlaybackRegions()) c->selected_regions.push_back(hostID(r->getHostRef()));
-        for (auto* s : selection->getRegionSequences()) c->selected_sequences.push_back(hostID(s->getHostRef()));
-        const ARAContentTimeRange* range = selection->getTimeRange(); c->selection_has_time_range = range != nullptr;
-        c->selection_start = range ? range->start : 0; c->selection_duration = range ? range->duration : 0;
-        c->selection_document_id = 1; ++c->selection_changes; dc->sync(false);
+    void doNotifySelection(const ViewSelection*) noexcept override {
+        // EditorView owns and prunes the standard SDK ViewSelection.
+        getDocumentController<SampleDocumentController>()->sync(false, false, true);
     }
 };
 EditorView* SampleDocumentController::doCreateEditorView() noexcept { return new SampleView(this); }
@@ -372,7 +447,15 @@ public:
     const char* getManufacturerName() const noexcept override { return "AAP"; }
     const char* getInformationURL() const noexcept override { return "https://github.com/atsushieno/aap-ara"; }
     const char* getVersion() const noexcept override { return "0.1.0"; }
-    const char* getDocumentArchiveID() const noexcept override { return "org.androidaudioplugin.ara.sample.archive/2"; }
+    const char* getDocumentArchiveID() const noexcept override { return "org.androidaudioplugin.ara.sample.archive/3"; }
+    ARASize getCompatibleDocumentArchiveIDsCount() const noexcept override { return 1; }
+    const ARAPersistentID* getCompatibleDocumentArchiveIDs() const noexcept override {
+        static const ARAPersistentID ids[]{"org.androidaudioplugin.ara.sample.archive/2"}; return ids;
+    }
+    ARASize getAnalyzeableContentTypesCount() const noexcept override { return 1; }
+    const ARAContentType* getAnalyzeableContentTypes() const noexcept override {
+        static const ARAContentType types[]{kARAContentTypeNotes}; return types;
+    }
 };
 static ARAAAPPlugInExtension sdkExtension{
     [](AndroidAudioPlugin*) -> const ARAFactory* { return PlugInEntry::getPlugInEntry<SampleFactoryConfig, SampleDocumentController>()->getFactory(); },
@@ -483,7 +566,7 @@ extern "C" AndroidAudioPluginFactory* GetAndroidAudioPluginFactory() {
 }
 
 
-uint64_t sample_plugin::resolveSnapshot(AndroidAudioPlugin* plugin) {
+uint64_t sample_plugin::resolveInstance(AndroidAudioPlugin* plugin) {
     std::lock_guard<std::mutex> lock(snapshots_mutex);
     auto found = plugin_snapshot_tokens.find(plugin);
     return found == plugin_snapshot_tokens.end() ? 0 : found->second;
@@ -501,7 +584,7 @@ std::string sample_plugin::snapshot(uint64_t token) {
     return model->json;
 }
 
-std::string sample_plugin::setModificationGain(uint64_t token, int64_t id, double gain) {
+std::string sample_plugin::setModificationGain(uint64_t token, ARAAudioModificationHostRef ref, double gain) {
     std::shared_ptr<SamplePluginContext> context;
     { const std::lock_guard<std::mutex> lock(snapshots_mutex); auto found = editable_contexts.find(token); if (found == editable_contexts.end()) return "The host has released this instance."; context = found->second; }
     const std::lock_guard<std::recursive_mutex> lifetime(context->model_mutex);
@@ -511,7 +594,28 @@ std::string sample_plugin::setModificationGain(uint64_t token, int64_t id, doubl
         if (context->released) { error = "The host has released this instance."; return; }
         if (context->model_update_active || !std::isfinite(gain) || gain < 0 || gain > 2) { error = "Invalid modification edit"; return; }
         auto* dc = context->binding->getDocumentController<SampleDocumentController>();
-        if (!dc || !context->reverse_updates_supported || !dc->setGain(id, gain)) error = "Modification unavailable";
+        if (!dc || !context->reverse_updates_supported || !dc->setGain(ref, gain)) error = "Modification unavailable";
     });
     return error;
+}
+
+bool sample_plugin::withDocument(uint64_t token,
+        const std::function<void(const ARA::PlugIn::Document&)>& action) {
+    std::shared_ptr<SamplePluginContext> context;
+    {
+        const std::lock_guard<std::mutex> lock(snapshots_mutex);
+        auto found = editable_contexts.find(token);
+        if (found == editable_contexts.end()) return false;
+        context = found->second;
+    }
+    const std::lock_guard<std::recursive_mutex> lifetime(context->model_mutex);
+    if (context->released || !context->ara) return false;
+    bool available = false;
+    context->ara->synchronize([&] {
+        auto* controller = context->binding->getDocumentController<SampleDocumentController>();
+        if (!controller || !controller->getDocument()) return;
+        action(*controller->getDocument());
+        available = true;
+    });
+    return available;
 }

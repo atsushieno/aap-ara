@@ -66,7 +66,7 @@ boundary.
   form,
 - host verifies the observed metrics against the expected source data.
 
-This is the first milestone that proves real ARA-like prefetched audio access.
+This is the first milestone that proves ARA host-provided audio access.
 
 ### Milestone 3: content invalidation and reread
 

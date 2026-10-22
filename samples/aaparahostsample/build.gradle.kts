@@ -59,3 +59,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }
+
+// The host's connected tests discover and load the companion plug-in APK.
+// Make installation an actual dependency even when Gradle runs tasks in parallel.
+tasks.matching { it.name == "connectedDebugAndroidTest" }.configureEach {
+    dependsOn(":samples:aaparapluginsample:installDebug")
+}

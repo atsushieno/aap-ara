@@ -7,7 +7,7 @@ Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_resolveSnap
         JNIEnv*, jobject, jlong servicePointer, jint instanceId) {
     auto* service = reinterpret_cast<aap::PluginService*>(servicePointer);
     auto* instance = service ? service->getLocalInstance(instanceId) : nullptr;
-    return instance ? sample_plugin::resolveSnapshot(instance->getPlugin()) : 0;
+    return instance ? sample_plugin::resolveInstance(instance->getPlugin()) : 0;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -19,5 +19,6 @@ Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_snapshot(
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_setModificationGain(
         JNIEnv* env, jobject, jlong token, jlong id, jdouble gain) {
-    return env->NewStringUTF(sample_plugin::setModificationGain(token, id, gain).c_str());
+    auto ref = reinterpret_cast<ARA::ARAAudioModificationHostRef>(static_cast<intptr_t>(id));
+    return env->NewStringUTF(sample_plugin::setModificationGain(token, ref, gain).c_str());
 }

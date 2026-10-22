@@ -933,6 +933,12 @@ bool Host::Impl::hostCommand(Message& m) {
 
 void Host::Impl::install() {
     api.structSize = sizeof(api);
+    // The ARA 2 transport uses partial persistency. Deprecated ARA 1 archive
+    // operations still need callable slots in the advertised interface; report
+    // failure so hosts can use storeObjectsToArchive/restoreObjectsFromArchive.
+    api.beginRestoringDocumentFromArchive = [](ARADocumentControllerRef, ARAArchiveReaderHostRef) -> ARABool { return kARAFalse; };
+    api.endRestoringDocumentFromArchive = [](ARADocumentControllerRef, ARAArchiveReaderHostRef) -> ARABool { return kARAFalse; };
+    api.storeDocumentToArchive = [](ARADocumentControllerRef, ARAArchiveWriterHostRef) -> ARABool { return kARAFalse; };
     api.destroyDocumentController = [](ARADocumentControllerRef r) { auto& s = self(r); s.query(DestroyDocument); s.alive = false; };
     api.getFactory = [](ARADocumentControllerRef r) -> const ARAFactory* { return &self(r).factory; };
     api.beginEditing = [](ARADocumentControllerRef r) { auto& s = self(r); s.wire->begin_model_update(s.wire, s.plugin, 0); s.editing = true; };

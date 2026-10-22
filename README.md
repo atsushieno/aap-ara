@@ -69,14 +69,18 @@ The latest device verification is recorded in
 
 ## Shared sample editor
 
-`samples/common` owns the editor runtime, Compose UI/model, Android JNI adapter,
+`samples/common` owns the editor runtime, Compose UI/model and timeline, Android JNI adapter,
 and shared editor tests. Both sample apps consume this directory independently;
 neither app includes sources from the other app. Each app keeps its own launcher,
 and the plugin app owns its plugin implementation, plugin JNI adapter, and service UI.
 
 The common CMake module defines `aap-ara-sample-editor` (the JNI-free native core)
 and `aap-ara-sample-editor-jni` (the Android adapter). A different frontend, such as
-SDL, can link the core and call `sample_editor` with native `Track` and `Clip` rows.
+SDL, can link the core and pass `sample_editor::documentController()` to existing
+ARA host code. It returns the SDK's `ARADocumentControllerInstance`;
+`plugInExtension()` returns its `ARAPlugInExtensionInstance`. The Compose project
+helper consumes SDK property structs and references, with sample-owned tone settings
+and archive bytes. It does not define a second native track/clip model.
 Supply an AAP connection list and plugin snapshot, keep them alive for the editor
 session, and serialize host calls on one worker thread. Java strings/arrays,
 Binder setup, and Java-side connection lookup stay in `android/sample-editor-jni.cpp`.
@@ -85,8 +89,10 @@ The shared Kotlin API is `org.androidaudioplugin.arasample.SampleEditorNative`.
 The plugin's own `aap-ara-plugin-sample.cpp` exposes a JNI-free `sample_plugin`
 interface through its adjacent header. Its `aap-ara-plugin-sample-jni.cpp` adapter
 resolves the service instance and converts Java values. The core resolves opaque
-snapshot tokens, reads JSON snapshots, and applies modification gain edits with
-lifetime checks and synchronization.
+instance tokens and provides `withDocument()` for native editors to read the real
+`ARA::PlugIn::Document` on its model thread. JSON snapshots are rendered directly
+from those same SDK objects for Compose. Gain edits use
+`ARAAudioModificationHostRef` and the SDK's content-update notifications.
 
 ## Project editor
 
@@ -124,8 +130,11 @@ and playback region. Stable IDs survive edits and undo/redo. Source-content edit
 notify the plugin to reread samples; removals destroy dependents before parents.
 
 **Save** and **Load** use one JSON project in the host app's private storage.
-Unsaved edits survive activity recreation. **Run Scenario** retains the original
-pre/post-content-change sample-read verification on a separate plugin instance.
+Unsaved edits survive activity recreation. **Run Scenario** runs the original
+pre/post-content-change sample-read verification
+and all eight supported upstream ARA_Examples TestHost scenarios, on separate
+plugin instances. See [scenario coverage](docs/SCENARIO_COVERAGE.md) for the API
+coverage and the original plug-in’s new note readers and processing algorithms.
 Native operations run serially off the UI thread; editing is paused while they run.
 Reverse notifications enqueue work on the host; archives are fetched after the
 callback returns. Host restoration never echoes a plugin-originated notification.

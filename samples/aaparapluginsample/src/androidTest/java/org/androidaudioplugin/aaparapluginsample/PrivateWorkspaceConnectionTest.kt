@@ -27,8 +27,14 @@ class PrivateWorkspaceConnectionTest {
             runBlocking { withTimeout(10000) { externalHost.bindAudioPluginService(service) } }
             val report = SampleEditorNative.runScenario(workspace.serviceConnectionId, pluginId, 48000)
             assertTrue(report, report.contains("Result: PASS"))
+            assertTrue(report, report.contains("Upstream scenarios: PASS (8/8)"))
+            listOf("Property updates", "Content updates", "Content reading", "Modification cloning",
+                "Archiving", "Split archives", "Drag and drop", "Processing algorithms").forEach {
+                assertTrue(report, report.contains("PASS: $it"))
+            }
             val externalReport = SampleEditorNative.runScenario(externalHost.serviceConnectionId, pluginId, 48000)
             assertTrue(externalReport, externalReport.contains("Result: PASS"))
+            assertTrue(externalReport, externalReport.contains("Upstream scenarios: PASS (8/8)"))
         } finally {
             SampleEditorNative.closeEditor()
             externalHost.close()

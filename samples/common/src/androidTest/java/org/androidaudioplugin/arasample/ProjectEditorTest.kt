@@ -54,6 +54,11 @@ class ProjectEditorTest {
             assertEquals("", SampleEditorNative.verifyEditorAudio(project.clips[0].id, true))
             val report = SampleEditorNative.runScenario(connector.serviceConnectionId, pluginId, 48000)
             assertTrue(report, report.contains("Result: PASS"))
+            assertTrue(report, report.contains("Upstream scenarios: PASS (8/8)"))
+            listOf("Property updates", "Content updates", "Content reading", "Modification cloning",
+                "Archiving", "Split archives", "Drag and drop", "Processing algorithms").forEach {
+                assertTrue(report, report.contains("PASS: $it"))
+            }
             project.clips.clear(); project.tracks.clear()
             assertEquals("", project.sync())
         } finally {

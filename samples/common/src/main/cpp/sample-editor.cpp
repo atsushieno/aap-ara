@@ -1,4 +1,6 @@
 #include "sample-editor.h"
+#include "sample-project.h"
+#include "upstream-scenarios.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -11,6 +13,11 @@
 #include "aap/core/host/plugin-host.h"
 #include "aap/core/host/plugin-instance.h"
 #include "sample-host-services.h"
+#include "aap/ara/araaap.hpp"
+#include <type_traits>
+
+using aap::ara::hostRef;
+using aap::ara::hostID;
 #include "aap/ara/remote-host.h"
 #include "aap/ara/registry.h"
 #include "aap/core/aapxs/ara-aapxs.h"
@@ -186,7 +193,7 @@ std::string sample_editor::runScenario(aap::PluginClientConnectionList* connecti
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "Resolved plugin ARA extension");
 
         HostScenarioContext host_context(sampleRate);
-        host_context.runtime.registerAudioSource(30, host_context.source_provider);
+        host_context.runtime.registerAudioSource(hostRef<ARAAudioSourceHostRef>(30), host_context.source_provider);
         ARADocumentProperties documentProperties{sizeof(documentProperties), "Sample Document"};
         auto sdk = std::make_unique<aap::ara::Host>(plugin, ara, &host_context.runtime.instance, &documentProperties);
         auto host_bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(sdk->transportExtension(), *instance);
@@ -306,7 +313,7 @@ std::string sample_editor::runScenario(aap::PluginClientConnectionList* connecti
                         metrics_match(actual_pre_r, expected_pre.right) &&
                         metrics_match(actual_post_l, expected_post.left) &&
                         metrics_match(actual_post_r, expected_post.right);
-        report << "\nResult: " << (verified ? "PASS" : "FAIL") << "\n";
+        report << "\nAudio fetch result: " << (verified ? "PASS" : "FAIL") << "\n";
         report << "  pre_ready=" << boolString(pre_ready) << "\n";
         report << "  post_ready=" << boolString(post_ready) << "\n";
         report << "  verification=" << boolString(verified) << "\n";
@@ -326,9 +333,13 @@ std::string sample_editor::runScenario(aap::PluginClientConnectionList* connecti
         sdk.reset(); host_bridge.reset();
         client->destroyInstance(instance);
         client.reset();
+        auto upstream = sample_scenarios::runUpstreamScenarios(connections, pluginIdString);
+        const bool allPassed = verified && upstream.find("Upstream scenarios: PASS (8/8)") != std::string::npos;
         aap::a_log(AAP_LOG_LEVEL_INFO, LOG_TAG, "runScenario completed successfully");
 
-        return report.str();
+        // Lead with the complete result and case list in the editor's small status panel.
+        return std::string("Result: ") + (allPassed ? "PASS" : "FAIL") + "\n" + upstream +
+                "\nAudio fetch details:\n" + report.str();
     } catch (const std::exception& ex) {
         aap::a_log_f(AAP_LOG_LEVEL_ERROR, LOG_TAG,
                      "Scenario failed with native exception: %s", ex.what());
@@ -361,8 +372,10 @@ public:
         return true;
     }
 };
-struct EditorClip { int track; std::string name, plugin_state; double start, offset, duration; float frequency, gain;
-    std::shared_ptr<ToneProvider> provider; };
+struct EditorClip {
+    std::string plugin_state;
+    std::shared_ptr<ToneProvider> provider;
+};
 struct EditorSession {
     std::unique_ptr<aap::PluginClient> client;
     aap::RemotePluginInstance* instance{};
@@ -381,11 +394,9 @@ struct EditorSession {
     std::map<int, ARAPlaybackRegionRef> regionRefs;
     AndroidAudioPlugin* plugin{};
     int rate;
-    std::map<int, std::string> tracks;
     std::map<int, EditorClip> clips;
     bool document_created{};
     bool supports_archive = false;
-    bool supports_selection = false;
     std::mutex updates_mutex;
     std::vector<SampleContentUpdate> pending_updates;
     explicit EditorSession(int rate_) : rate(rate_) {
@@ -397,7 +408,7 @@ struct EditorSession {
         binding->playbackRendererInterface->removePlaybackRegion(binding->playbackRendererRef, regionRefs.at(id));
         ara->destroyPlaybackRegion(dc, regionRefs.at(id)); ara->destroyAudioModification(dc, modificationRefs.at(id));
         ara->enableAudioSourceSamplesAccess(dc, sourceRefs.at(id), kARAFalse); ara->destroyAudioSource(dc, sourceRefs.at(id));
-        runtime.unregisterAudioSource(id); clips.erase(id); regionRefs.erase(id); modificationRefs.erase(id); sourceRefs.erase(id);
+        runtime.unregisterAudioSource(hostRef<ARAAudioSourceHostRef>(id)); clips.erase(id); regionRefs.erase(id); modificationRefs.erase(id); sourceRefs.erase(id);
     }
     ~EditorSession() {
         runtime.onUpdate = {};
@@ -460,7 +471,7 @@ std::string sample_editor::openEditor(aap::PluginClientConnectionList* connectio
         session->bridge = std::make_unique<aap::ara::ScopedRemotePluginInstanceARAHostContext>(session->sdk->transportExtension(), *session->instance);
         auto* controller = session->sdk->documentController(); session->ara = controller->documentControllerInterface; session->dc = controller->documentControllerRef;
         session->binding = session->sdk->bind(kARAPlaybackRendererRole | kARAEditorRendererRole | kARAEditorViewRole, kARAPlaybackRendererRole | kARAEditorViewRole);
-        session->supports_archive = true; session->supports_selection = session->binding->editorViewInterface != nullptr;
+        session->supports_archive = true;
         session->instance->prepare(8, rate);
         session->ara->beginEditing(session->dc);
         ARAMusicalContextProperties context{sizeof(context), "Song", 0, nullptr};
@@ -474,28 +485,31 @@ std::string sample_editor::openEditor(aap::PluginClientConnectionList* connectio
 
 void sample_editor::closeEditor() { editor.reset(); }
 
-std::string sample_editor::notifyEditorSelection(const std::vector<int32_t>& clips,
-        const std::vector<int32_t>& tracks, bool hasRange, double start, double duration) {
-    if (!editor)
-        return "Editor is not connected";
-    auto& s = *editor;
-    if (!s.supports_selection)
-        return "Plugin does not support host selection";
-    if (uint64_t(clips.size()) + tracks.size() > (ARA_SHARED_MEMORY_SIZE - sizeof(aap_ara_view_selection_wire_t)) / sizeof(int64_t))
-        return "Selection exceeds transport capacity";
-    for (auto id : clips)
-        if (!s.clips.count(id))
-            return "Unknown selected clip";
-    for (auto id : tracks)
-        if (!s.tracks.count(id))
-            return "Unknown selected track";
-    std::vector<ARAPlaybackRegionRef> regions; std::vector<ARARegionSequenceRef> sequences;
-    for (auto id : clips) regions.push_back(s.regionRefs.at(id));
-    for (auto id : tracks) sequences.push_back(s.sequenceRefs.at(id));
-    ARAContentTimeRange range{start, duration};
-    ARAViewSelection selection{sizeof(selection), regions.size(), regions.data(), sequences.size(), sequences.data(), hasRange ? &range : nullptr};
-    try { s.binding->editorViewInterface->notifySelection(s.binding->editorViewRef, &selection); return ""; }
-    catch (const std::exception& e) { return e.what(); }
+const ARADocumentControllerInstance* sample_editor::documentController() {
+    return editor ? editor->sdk->documentController() : nullptr;
+}
+const ARAPlugInExtensionInstance* sample_editor::plugInExtension() {
+    return editor ? editor->binding : nullptr;
+}
+ARASampleRate sample_editor::sampleRate() { return editor ? editor->rate : 48000; }
+ARARegionSequenceRef sample_editor::regionSequenceRef(ARARegionSequenceHostRef ref) {
+    if (!editor) return nullptr;
+    auto found = editor->sequenceRefs.find(hostID(ref));
+    return found == editor->sequenceRefs.end() ? nullptr : found->second;
+}
+ARAPlaybackRegionRef sample_editor::playbackRegionRef(ARAPlaybackRegionHostRef ref) {
+    if (!editor) return nullptr;
+    auto found = editor->regionRefs.find(hostID(ref));
+    return found == editor->regionRefs.end() ? nullptr : found->second;
+}
+std::string sample_editor::notifyEditorSelection(const ARAViewSelection& selection) {
+    auto* binding = plugInExtension();
+    if (!binding) return "Editor is not connected";
+    if (!binding->editorViewInterface) return "Plugin does not support host selection";
+    try {
+        binding->editorViewInterface->notifySelection(binding->editorViewRef, &selection);
+        return "";
+    } catch (const std::exception& e) { return e.what(); }
 }
 
 // Drain on the editor worker, after the reverse Binder callback has returned.
@@ -512,14 +526,20 @@ std::vector<std::string> sample_editor::drainPluginUpdates() {
         }
         std::set<int> ids;
         for (const auto& update : updates) {
-            if (update.kind == 4) for (const auto& clip : s.clips) ids.insert(clip.first);
-            else if (update.kind >= 1 && update.kind <= 3 &&
-                     s.clips.count(update.object_id)) ids.insert(update.object_id);
+            std::visit([&](auto ref) {
+                using Ref = decltype(ref);
+                if constexpr (std::is_same_v<Ref, std::monostate>) {
+                    for (const auto& clip : s.clips) ids.insert(clip.first);
+                } else {
+                    auto id = hostID(ref);
+                    if (s.clips.count(id)) ids.insert(id);
+                }
+            }, update);
         }
         for (int id : ids) {
             std::string bytes;
             if (!s.sdk->storeModification(s.modificationRefs.at(id), bytes)) {
-                const std::lock_guard<std::mutex> lock(s.updates_mutex); s.pending_updates.push_back({2, id}); continue;
+                const std::lock_guard<std::mutex> lock(s.updates_mutex); s.pending_updates.push_back(hostRef<ARAAudioModificationHostRef>(id)); continue;
             }
             auto state = archive_hex(bytes.data(), bytes.size());
             if (s.clips.at(id).plugin_state == state) continue;
@@ -531,74 +551,77 @@ std::vector<std::string> sample_editor::drainPluginUpdates() {
 }
 
 // Stable IDs preserve registered providers across edits.
-std::string sample_editor::syncEditor(const std::string& title,
-        const std::vector<Track>& tracks, const std::vector<Clip>& clips) {
+std::string sample_project::sync(const ARADocumentProperties& document,
+        const std::vector<RegionSequence>& sequences, const std::vector<PlaybackRegion>& regions) {
     if (!editor) return "Editor is not connected";
     auto& s = *editor;
-    const auto nt = tracks.size(), nc = clips.size();
     std::vector<int32_t> tids, ids;
-    for (const auto& track : tracks) tids.push_back(track.id);
-    for (const auto& clip : clips) {
-        ids.push_back(clip.id);
-        if (std::find(tids.begin(), tids.end(), clip.track) == tids.end() ||
-            !std::isfinite(clip.start) || !std::isfinite(clip.offset) || !std::isfinite(clip.duration) ||
-            !std::isfinite(clip.frequency) || !std::isfinite(clip.gain) || clip.start < 0 || clip.offset < 0 ||
-            clip.duration <= 0 || clip.offset + clip.duration > 60 || clip.frequency < 20 ||
-            clip.frequency > 20000 || clip.gain < 0 || clip.gain > 1)
+    for (const auto& sequence : sequences) tids.push_back(hostID(sequence.first));
+    for (const auto& region : regions) {
+        ids.push_back(hostID(region.hostRef));
+        const auto& p = region.properties;
+        if (std::find(tids.begin(), tids.end(), hostID(region.sequenceHostRef)) == tids.end() ||
+            !std::isfinite(p.startInPlaybackTime) || !std::isfinite(p.startInModificationTime) ||
+            !std::isfinite(p.durationInPlaybackTime) || !std::isfinite(p.durationInModificationTime) ||
+            !std::isfinite(region.frequency) || !std::isfinite(region.gain) || p.startInPlaybackTime < 0 ||
+            p.startInModificationTime < 0 || p.durationInPlaybackTime <= 0 || p.durationInModificationTime <= 0 ||
+            p.startInModificationTime + p.durationInModificationTime > 60 || region.frequency < 20 ||
+            region.frequency > 20000 || region.gain < 0 || region.gain > 1 ||
+            region.source.sampleRate != s.rate || region.source.sampleCount != s.rate * 60 || region.source.channelCount != 2)
             return "Invalid clip properties";
     }
+    const auto nc = regions.size();
     auto* a = s.ara; auto p = s.dc;
     std::vector<std::string> states;
     std::vector<std::vector<uint8_t>> archives(nc);
     for (int i = 0; i < nc; ++i) {
-        states.push_back(clips[i].pluginState);
+        states.push_back(regions[i].pluginState);
         if (!archive_bytes(states.back(), archives[i])) return "Invalid plugin state archive";
         if (!s.supports_archive && !states.back().empty()) return "Plugin does not support modification archives";
     }
     a->beginEditing(p);
-    auto name = title;
-    ARADocumentProperties doc{sizeof(doc), name.c_str()};
-    a->updateDocumentProperties(p, &doc);
+    a->updateDocumentProperties(p, &document);
     for (auto it = s.clips.begin(); it != s.clips.end();) {
         int id = (it++)->first;
         if (std::find(ids.begin(), ids.end(), id) == ids.end()) s.removeClip(id);
     }
     // Create new sequences before moving clips; remove obsolete sequences last.
-    for (int i = 0; i < nt; ++i) {
-        auto n = tracks[i].name, persistent = "track-" + std::to_string(tids[i]);
-        ARARegionSequenceProperties props{sizeof(props), n.c_str(), i, s.musicalContext, nullptr};
-        if (s.tracks.count(tids[i])) a->updateRegionSequenceProperties(p, s.sequenceRefs.at(tids[i]), &props);
-        else s.sequenceRefs[tids[i]] = a->createRegionSequence(p, hostRef<ARARegionSequenceHostRef>(tids[i]), &props);
-        s.tracks[tids[i]] = n;
+    for (const auto& [ref, properties] : sequences) {
+        const auto id = hostID(ref);
+        auto props = properties;
+        props.musicalContextRef = s.musicalContext;
+        if (s.sequenceRefs.count(id)) a->updateRegionSequenceProperties(p, s.sequenceRefs.at(id), &props);
+        else s.sequenceRefs[id] = a->createRegionSequence(p, ref, &props);
     }
-    for (int i = 0; i < nc; ++i) {
-        int id = ids[i]; bool fresh = !s.clips.count(id);
-        auto n = clips[i].name, persistent = "clip-" + std::to_string(id);
+    for (size_t i = 0; i < nc; ++i) {
+        int id = ids[i];
+        bool fresh = !s.clips.count(id);
+        const auto& input = regions[i];
         auto& c = s.clips[id];
-        bool changed = fresh || c.frequency != float(clips[i].frequency) || c.gain != float(clips[i].gain);
-        c.track = clips[i].track; c.name = n; c.start = clips[i].start; c.offset = clips[i].offset; c.duration = clips[i].duration;
-        c.frequency = clips[i].frequency; c.gain = clips[i].gain;
+        bool changed = fresh || c.provider->frequency != float(input.frequency) || c.provider->gain != float(input.gain);
         if (fresh) {
             c.provider = std::make_shared<ToneProvider>(s.rate);
-            s.runtime.registerAudioSource(id, c.provider);
-            ARAAudioSourceProperties source{sizeof(source), n.c_str(), persistent.c_str(), s.rate * 60, double(s.rate), 2, kARAFalse, kARAChannelArrangementUndefined, nullptr};
-            s.sourceRefs[id] = a->createAudioSource(p, hostRef<ARAAudioSourceHostRef>(id), &source);
-            ARAAudioModificationProperties modification{sizeof(modification), n.c_str(), persistent.c_str()};
-            s.modificationRefs[id] = a->createAudioModification(p, s.sourceRefs.at(id), hostRef<ARAAudioModificationHostRef>(id), &modification);
+            s.runtime.registerAudioSource(hostRef<ARAAudioSourceHostRef>(id), c.provider);
+            s.sourceRefs[id] = a->createAudioSource(p, hostRef<ARAAudioSourceHostRef>(id), &input.source);
+            s.modificationRefs[id] = a->createAudioModification(p, s.sourceRefs.at(id), hostRef<ARAAudioModificationHostRef>(id), &input.modification);
         }
-        c.provider->frequency = c.frequency; c.provider->gain = c.gain;
-        ARAPlaybackRegionProperties region{sizeof(region), kARAPlaybackTransformationNoChanges, c.offset, c.duration, c.start, c.duration, nullptr, s.sequenceRefs.at(c.track), n.c_str(), nullptr};
-        if (fresh) { s.regionRefs[id] = a->createPlaybackRegion(p, s.modificationRefs.at(id), hostRef<ARAPlaybackRegionHostRef>(id), &region);
-            s.binding->playbackRendererInterface->addPlaybackRegion(s.binding->playbackRendererRef, s.regionRefs.at(id)); }
-        else {
+        c.provider->frequency = input.frequency;
+        c.provider->gain = input.gain;
+        auto region = input.properties;
+        region.regionSequenceRef = s.sequenceRefs.at(hostID(input.sequenceHostRef));
+        if (fresh) {
+            s.regionRefs[id] = a->createPlaybackRegion(p, s.modificationRefs.at(id), input.hostRef, &region);
+            s.binding->playbackRendererInterface->addPlaybackRegion(s.binding->playbackRendererRef, s.regionRefs.at(id));
+        } else {
             a->updatePlaybackRegionProperties(p, s.regionRefs.at(id), &region);
-            ARAAudioSourceProperties source{sizeof(source), n.c_str(), persistent.c_str(), s.rate * 60, double(s.rate), 2, kARAFalse, kARAChannelArrangementUndefined, nullptr};
-            a->updateAudioSourceProperties(p, s.sourceRefs.at(id), &source);
-            ARAAudioModificationProperties modification{sizeof(modification), n.c_str(), persistent.c_str()};
-            a->updateAudioModificationProperties(p, s.modificationRefs.at(id), &modification);
+            a->updateAudioSourceProperties(p, s.sourceRefs.at(id), &input.source);
+            a->updateAudioModificationProperties(p, s.modificationRefs.at(id), &input.modification);
         }
         if (fresh) a->enableAudioSourceSamplesAccess(p, s.sourceRefs.at(id), kARATrue);
-        else if (changed) { ARAContentTimeRange range{0, 60}; a->updateAudioSourceContent(p, s.sourceRefs.at(id), &range, kARAContentUpdateEverythingChanged); }
+        else if (changed) {
+            ARAContentTimeRange range{0, 60};
+            a->updateAudioSourceContent(p, s.sourceRefs.at(id), &range, kARAContentUpdateEverythingChanged);
+        }
         if (s.supports_archive && c.plugin_state != states[i]) {
             if (!s.sdk->restoreModification(s.modificationRefs.at(id), archives[i].data(), archives[i].size())) {
                 a->endEditing(p);
@@ -607,9 +630,10 @@ std::string sample_editor::syncEditor(const std::string& title,
             c.plugin_state = states[i];
         }
     }
-    for (auto it = s.tracks.begin(); it != s.tracks.end();) {
+    for (auto it = s.sequenceRefs.begin(); it != s.sequenceRefs.end();) {
         if (std::find(tids.begin(), tids.end(), it->first) == tids.end()) {
-            a->destroyRegionSequence(p, s.sequenceRefs.at(it->first)); s.sequenceRefs.erase(it->first); it = s.tracks.erase(it);
+            a->destroyRegionSequence(p, it->second);
+            it = s.sequenceRefs.erase(it);
         } else ++it;
     }
     a->endEditing(p);
