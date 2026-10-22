@@ -18,10 +18,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
-import org.androidaudioplugin.aaparahostsample.ProjectClip
-import org.androidaudioplugin.aaparahostsample.ProjectDocument
-import org.androidaudioplugin.aaparahostsample.ProjectTimeline
-import org.androidaudioplugin.aaparahostsample.ProjectTrack
+import org.androidaudioplugin.arasample.ProjectClip
+import org.androidaudioplugin.arasample.ProjectDocument
+import org.androidaudioplugin.arasample.ProjectTimeline
+import org.androidaudioplugin.arasample.ProjectTrack
 import org.json.JSONObject
 
 /** Observes the ARA graph of the exact plugin instance selected by the host. */

@@ -1,4 +1,4 @@
-package org.androidaudioplugin.aaparahostsample
+package org.androidaudioplugin.arasample
 
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.fillMaxSize
@@ -40,8 +40,8 @@ class ProjectHostedEditorTest {
             runBlocking { withTimeout(10_000) {
                 connector.bindAudioPluginService(AudioPluginHostHelper.queryAudioPluginService(context, packageName))
             } }
-            assertEquals("", AraHostSampleNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
-            val instanceId = AraHostSampleNative.editorInstanceId()
+            assertEquals("", SampleEditorNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
+            val instanceId = SampleEditorNative.editorInstanceId()
             val document = ProjectDocument().apply {
                 tracks.add(ProjectTrack(nextId++, "Surface track"))
                 clips.add(ProjectClip(nextId++, tracks[0].id, "Surface phrase"))
@@ -55,7 +55,7 @@ class ProjectHostedEditorTest {
             compose.waitUntil(10_000) { laidOut.get() }
         } finally {
             compose.runOnUiThread { client.close() }
-            AraHostSampleNative.closeEditor()
+            SampleEditorNative.closeEditor()
             connector.close()
         }
     }

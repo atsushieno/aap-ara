@@ -1,8 +1,8 @@
-package org.androidaudioplugin.aaparahostsample
+package org.androidaudioplugin.arasample
 
-object AraHostSampleNative {
+object SampleEditorNative {
     init {
-        System.loadLibrary("aap-ara-host-sample")
+        System.loadLibrary("aap-ara-sample-editor-jni")
     }
 
     external fun createPrivateConnection(serviceConnectionId: Int, packageName: String, serviceClass: String): android.os.IBinder

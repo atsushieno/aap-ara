@@ -1,4 +1,4 @@
-package org.androidaudioplugin.aaparahostsample
+package org.androidaudioplugin.arasample
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.foundation.layout.fillMaxSize

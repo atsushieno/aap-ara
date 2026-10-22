@@ -11,7 +11,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.androidaudioplugin.AudioPluginServiceHelper
-import org.androidaudioplugin.aaparahostsample.*
+import org.androidaudioplugin.arasample.*
 import org.androidaudioplugin.hosting.AudioPluginClientBase
 import org.androidaudioplugin.hosting.AudioPluginHostHelper
 import org.androidaudioplugin.hosting.AudioPluginServiceConnector
@@ -34,8 +34,8 @@ class ReceivedDocumentTest {
         var instanceId = -1
         try {
             runBlocking { withTimeout(10_000) { connector.bindAudioPluginService(service) } }
-            assertEquals("", AraHostSampleNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
-            instanceId = AraHostSampleNative.editorInstanceId()
+            assertEquals("", SampleEditorNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
+            instanceId = SampleEditorNative.editorInstanceId()
             val project = ProjectDocument().apply {
                 title = "Synchronization test"
                 tracks.add(ProjectTrack(nextId++, "Host track"))
@@ -58,7 +58,7 @@ class ReceivedDocumentTest {
             val initial = JSONObject(AraPluginSampleNative.snapshot(token))
             assertEquals(project.clips[0].id, initial.getJSONArray("clips").getJSONObject(0).getInt("id"))
             // Another instance's scenario must not replace this view's model.
-            val scenario = AraHostSampleNative.runScenario(connector.serviceConnectionId, pluginId, 48000)
+            val scenario = SampleEditorNative.runScenario(connector.serviceConnectionId, pluginId, 48000)
             assertTrue(scenario, scenario.contains("Result: PASS"))
             assertEquals(initial.toString(), JSONObject(AraPluginSampleNative.snapshot(token)).toString())
             project.title = "Host renamed project"
@@ -74,7 +74,7 @@ class ReceivedDocumentTest {
             assertEquals(5.0, clip.getDouble("start"), 0.0)
             assertEquals(1.0, clip.getDouble("offset"), 0.0)
             assertEquals(2.0, clip.getDouble("duration"), 0.0)
-            assertEquals("", AraHostSampleNative.verifyEditorAudio(project.clips[0].id, true))
+            assertEquals("", SampleEditorNative.verifyEditorAudio(project.clips[0].id, true))
             // Plugin-owned content edits travel through the reverse AAPXS path.
             // Save the opaque archive in the host project and restore it on undo/redo.
             assertTrue(edited.toString(), edited.getBoolean("canEdit"))
@@ -88,7 +88,7 @@ class ReceivedDocumentTest {
             }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Edit sent to host.").fetchSemanticsNodes().isNotEmpty() }
             val beforePluginEdit = project.encode()
-            val updates = AraHostSampleNative.drainPluginUpdates()
+            val updates = SampleEditorNative.drainPluginUpdates()
             assertEquals(updates.toList().toString(), 2, updates.size)
             assertEquals(project.clips[0].id.toString(), updates[0])
             assertTrue(project.applyPluginUpdates(updates))
@@ -96,51 +96,51 @@ class ReceivedDocumentTest {
             assertEquals(project.clips[0].pluginState, ProjectDocument.decode(savedPluginEdit).clips[0].pluginState)
             val soundEdit = JSONObject(AraPluginSampleNative.snapshot(token)).getJSONArray("clips").getJSONObject(0)
             assertEquals(clip.getDouble("processedRms") * 0.5, soundEdit.getDouble("processedRms"), 0.00001)
-            assertEquals("", AraHostSampleNative.verifyEditorAudio(project.clips[0].id, true, 0.5))
+            assertEquals("", SampleEditorNative.verifyEditorAudio(project.clips[0].id, true, 0.5))
             val invalidArchive = ProjectDocument.decode(savedPluginEdit).apply { clips[0].pluginState = "ff" }
             assertEquals("Plugin rejected modification archive", invalidArchive.sync())
             assertEquals(0.5, JSONObject(AraPluginSampleNative.snapshot(token)).getJSONArray("clips").getJSONObject(0).getDouble("modificationGain"), 0.0)
             // Host position changes preserve the existing sound edit and do not echo it.
             project.clips[0].start = 7.125
             assertEquals("", project.sync())
-            assertTrue(AraHostSampleNative.drainPluginUpdates().isEmpty())
+            assertTrue(SampleEditorNative.drainPluginUpdates().isEmpty())
             assertEquals(0.5, JSONObject(AraPluginSampleNative.snapshot(token)).getJSONArray("clips").getJSONObject(0).getDouble("modificationGain"), 0.0)
             assertEquals("", ProjectDocument.decode(beforePluginEdit).sync())
             assertEquals(1.0, JSONObject(AraPluginSampleNative.snapshot(token)).getJSONArray("clips").getJSONObject(0).getDouble("modificationGain"), 0.0)
-            assertTrue(AraHostSampleNative.drainPluginUpdates().isEmpty())
+            assertTrue(SampleEditorNative.drainPluginUpdates().isEmpty())
             assertEquals("", ProjectDocument.decode(savedPluginEdit).sync())
             assertEquals(0.5, JSONObject(AraPluginSampleNative.snapshot(token)).getJSONArray("clips").getJSONObject(0).getDouble("modificationGain"), 0.0)
-            assertTrue(AraHostSampleNative.drainPluginUpdates().isEmpty())
+            assertTrue(SampleEditorNative.drainPluginUpdates().isEmpty())
             project.clips.clear(); project.tracks.clear()
             assertEquals("", project.sync())
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Edited host phrase").fetchSemanticsNodes().isEmpty() }
             val removed = JSONObject(AraPluginSampleNative.snapshot(token))
             assertEquals(0, removed.getJSONArray("clips").length())
             assertEquals(0, removed.getJSONArray("sources").length())
-            AraHostSampleNative.closeEditor()
+            SampleEditorNative.closeEditor()
             assertEquals("null", AraPluginSampleNative.snapshot(token))
             assertEquals("The host has released this instance.", AraPluginSampleNative.setModificationGain(token, clip.getLong("modificationId"), 1.0))
             compose.waitUntil(5_000) {
                 compose.onAllNodesWithText("The host has released this instance.").fetchSemanticsNodes().isNotEmpty()
             }
             // Reconstruct a new ARA session from the saved host document.
-            assertEquals("", AraHostSampleNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
+            assertEquals("", SampleEditorNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
             val loaded = ProjectDocument.decode(savedPluginEdit)
             assertEquals("", loaded.sync())
             var restoredToken = 0L
             compose.runOnUiThread {
-                val restoredId = AraHostSampleNative.editorInstanceId()
+                val restoredId = SampleEditorNative.editorInstanceId()
                 val restoredView = AudioPluginServiceHelper.createNativeView(context.applicationContext, pluginId, restoredId)
                 restoredToken = restoredView.tag as Long
                 AudioPluginServiceHelper.maybeDestroyNativeView(context, pluginId, restoredId, restoredView)
             }
             assertNotEquals(token, restoredToken)
             assertEquals(0.5, JSONObject(AraPluginSampleNative.snapshot(restoredToken)).getJSONArray("clips").getJSONObject(0).getDouble("modificationGain"), 0.0)
-            assertEquals("", AraHostSampleNative.verifyEditorAudio(loaded.clips[0].id, false, 0.5))
-            assertTrue(AraHostSampleNative.drainPluginUpdates().isEmpty())
+            assertEquals("", SampleEditorNative.verifyEditorAudio(loaded.clips[0].id, false, 0.5))
+            assertTrue(SampleEditorNative.drainPluginUpdates().isEmpty())
         } finally {
             view?.let { compose.runOnUiThread { AudioPluginServiceHelper.maybeDestroyNativeView(context, pluginId, instanceId, it) } }
-            AraHostSampleNative.closeEditor()
+            SampleEditorNative.closeEditor()
             connector.close()
         }
     }

@@ -1,4 +1,4 @@
-package org.androidaudioplugin.aaparahostsample
+package org.androidaudioplugin.arasample
 
 import org.json.JSONArray
 import org.json.JSONObject
@@ -23,7 +23,7 @@ class ProjectDocument {
                 .put("frequency", it.frequency).put("gain", it.gain).put("pluginState", it.pluginState))
         } })
     }.toString(2)
-    fun sync(): String = AraHostSampleNative.syncEditor(title, tracks.map { it.id }.toIntArray(),
+    fun sync(): String = SampleEditorNative.syncEditor(title, tracks.map { it.id }.toIntArray(),
         tracks.map { it.name }.toTypedArray(), clips.map { it.id }.toIntArray(),
         clips.map { it.track }.toIntArray(), clips.map { it.name }.toTypedArray(),
         clips.flatMap { listOf(it.start, it.offset, it.duration, it.frequency, it.gain) }.toDoubleArray(),

@@ -1,6 +1,5 @@
-#include <jni.h>
+#include "aap-ara-plugin-sample.h"
 #include <aap/android-audio-plugin.h>
-#include <aap/core/host/plugin-host.h>
 #include <memory>
 #include <aap/ara/araaap.hpp>
 #include <ARA_Library/PlugIn/ARAPlug.h>
@@ -484,38 +483,29 @@ extern "C" AndroidAudioPluginFactory* GetAndroidAudioPluginFactory() {
 }
 
 
-extern "C" JNIEXPORT jlong JNICALL
-Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_resolveSnapshot(
-        JNIEnv*, jobject, jlong servicePointer, jint instanceId) {
-    auto* service = reinterpret_cast<aap::PluginService*>(servicePointer);
-    auto* instance = service ? service->getLocalInstance(instanceId) : nullptr;
-    if (!instance) return 0;
+uint64_t sample_plugin::resolveSnapshot(AndroidAudioPlugin* plugin) {
     std::lock_guard<std::mutex> lock(snapshots_mutex);
-    auto found = plugin_snapshot_tokens.find(instance->getPlugin());
+    auto found = plugin_snapshot_tokens.find(plugin);
     return found == plugin_snapshot_tokens.end() ? 0 : found->second;
 }
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_snapshot(
-        JNIEnv* env, jobject, jlong token) {
+std::string sample_plugin::snapshot(uint64_t token) {
     std::shared_ptr<PublishedModel> model;
     {
         std::lock_guard<std::mutex> lock(snapshots_mutex);
         auto found = snapshots.find(token);
-        if (found == snapshots.end()) return env->NewStringUTF("null");
+        if (found == snapshots.end()) return "null";
         model = found->second;
     }
     std::lock_guard<std::mutex> lock(model->mutex);
-    return env->NewStringUTF(model->json.c_str());
+    return model->json;
 }
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_setModificationGain(
-        JNIEnv* env, jobject, jlong token, jlong id, jdouble gain) {
+std::string sample_plugin::setModificationGain(uint64_t token, int64_t id, double gain) {
     std::shared_ptr<SamplePluginContext> context;
-    { const std::lock_guard<std::mutex> lock(snapshots_mutex); auto found = editable_contexts.find(token); if (found == editable_contexts.end()) return env->NewStringUTF("The host has released this instance."); context = found->second; }
+    { const std::lock_guard<std::mutex> lock(snapshots_mutex); auto found = editable_contexts.find(token); if (found == editable_contexts.end()) return "The host has released this instance."; context = found->second; }
     const std::lock_guard<std::recursive_mutex> lifetime(context->model_mutex);
-    if (context->released || !context->ara) return env->NewStringUTF("The host has released this instance.");
+    if (context->released || !context->ara) return "The host has released this instance.";
     std::string error;
     context->ara->synchronize([&] {
         if (context->released) { error = "The host has released this instance."; return; }
@@ -523,5 +513,5 @@ Java_org_androidaudioplugin_aaparapluginsample_AraPluginSampleNative_setModifica
         auto* dc = context->binding->getDocumentController<SampleDocumentController>();
         if (!dc || !context->reverse_updates_supported || !dc->setGain(id, gain)) error = "Modification unavailable";
     });
-    return env->NewStringUTF(error.c_str());
+    return error;
 }

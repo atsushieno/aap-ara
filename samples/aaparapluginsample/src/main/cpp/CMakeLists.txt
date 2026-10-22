@@ -7,7 +7,9 @@ include("${CMAKE_CURRENT_LIST_DIR}/../../../../../cmake/ARASDK.cmake")
 find_package(androidaudioplugin REQUIRED CONFIG)
 find_package(androidaudioplugin-ara REQUIRED CONFIG)
 
-add_library(aap-ara-plugin-sample SHARED aap-ara-plugin-sample.cpp)
+add_library(aap-ara-plugin-sample SHARED
+    aap-ara-plugin-sample.cpp
+    aap-ara-plugin-sample-jni.cpp)
 
 target_compile_options(aap-ara-plugin-sample
     PRIVATE
@@ -22,15 +24,9 @@ target_link_libraries(aap-ara-plugin-sample
     androidaudioplugin-ara::androidaudioplugin-ara
 )
 
-# The plugin app is also a document editor; reuse the standalone host's JNI bridge.
-add_library(aap-ara-host-sample SHARED
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../aaparahostsample/src/main/cpp/aap-ara-host-sample.cpp)
-target_compile_features(aap-ara-host-sample PRIVATE cxx_std_17)
-target_link_libraries(aap-ara-host-sample
-    ARA_Host_Library
-    android log
-    androidaudioplugin::androidaudioplugin
-    androidaudioplugin-ara::androidaudioplugin-ara)
+# The standalone workspace uses the common editor, independently of the host app.
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../../../common"
+    "${CMAKE_CURRENT_BINARY_DIR}/sample-common")
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_sources(aap-ara-plugin-sample PRIVATE

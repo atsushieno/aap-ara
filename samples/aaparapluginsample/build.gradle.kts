@@ -6,10 +6,10 @@ plugins {
 apply { from("../../common.gradle") }
 
 android {
+    // Both apps consume the common editor; neither consumes the other's sources.
+    sourceSets.getByName("main").kotlin.srcDir("../common/src/main/java")
+    sourceSets.getByName("androidTest").kotlin.srcDir("../common/src/androidTest/java")
     namespace = "org.androidaudioplugin.aaparapluginsample"
-    // Keep the standalone host and plugin application on the same editor UI/model.
-    sourceSets.getByName("main").kotlin.srcDir("../aaparahostsample/src/main/java")
-    sourceSets.getByName("androidTest").kotlin.srcDir("../aaparahostsample/src/androidTest/java")
     defaultConfig {
         applicationId = "org.androidaudioplugin.aaparapluginsample"
         externalNativeBuild {

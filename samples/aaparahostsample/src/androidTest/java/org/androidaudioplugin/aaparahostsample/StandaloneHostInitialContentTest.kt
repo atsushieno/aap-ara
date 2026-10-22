@@ -1,5 +1,6 @@
 package org.androidaudioplugin.aaparahostsample
 
+import org.androidaudioplugin.arasample.*
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
@@ -19,7 +20,7 @@ class StandaloneHostInitialContentTest {
     @Test fun openingExistingProjectShowsEveryClipAndRestoresLegacyGain() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
-        // The plug-in APK also imports host tests, but this covers the standalone host binary.
+        // This fixture covers the standalone host binary.
         assumeTrue(context.packageName == "org.androidaudioplugin.aaparahostsample")
         val project = ProjectDocument().apply {
             title = "Initial SDK project"

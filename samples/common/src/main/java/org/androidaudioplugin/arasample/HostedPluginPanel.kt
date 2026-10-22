@@ -1,4 +1,4 @@
-package org.androidaudioplugin.aaparahostsample
+package org.androidaudioplugin.arasample
 
 import android.os.Build
 import androidx.compose.foundation.layout.*

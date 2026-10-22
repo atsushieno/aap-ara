@@ -1,4 +1,4 @@
-package org.androidaudioplugin.aaparahostsample
+package org.androidaudioplugin.arasample
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable

@@ -1,4 +1,4 @@
-package org.androidaudioplugin.aaparahostsample
+package org.androidaudioplugin.arasample
 
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
@@ -37,7 +37,7 @@ class ProjectEditorTest {
             runBlocking { withTimeout(10000) {
                 connector.bindAudioPluginService(AudioPluginHostHelper.queryAudioPluginService(context, info.packageName))
             } }
-            assertEquals("", AraHostSampleNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
+            assertEquals("", SampleEditorNative.openEditor(connector.serviceConnectionId, pluginId, 48000))
             val project = ProjectDocument().apply {
                 tracks.add(ProjectTrack(nextId++, "Track one"))
                 tracks.add(ProjectTrack(nextId++, "Track two"))
@@ -45,19 +45,19 @@ class ProjectEditorTest {
                 clips.add(ProjectClip(nextId++, tracks[0].id, "Tone two", start = 5.0))
             }
             assertEquals("", project.sync())
-            assertEquals("", AraHostSampleNative.verifyEditorAudio(project.clips.last().id, false))
+            assertEquals("", SampleEditorNative.verifyEditorAudio(project.clips.last().id, false))
             project.title = "Edited project"
             project.clips[0].apply { track = project.tracks[1].id; start = 2.0; offset = 1.0; duration = 3.0; frequency = 440.0; gain = 0.4 }
             project.clips.removeAt(1)
             project.tracks.removeAt(0)
             assertEquals("", project.sync())
-            assertEquals("", AraHostSampleNative.verifyEditorAudio(project.clips[0].id, true))
-            val report = AraHostSampleNative.runScenario(connector.serviceConnectionId, pluginId, 48000)
+            assertEquals("", SampleEditorNative.verifyEditorAudio(project.clips[0].id, true))
+            val report = SampleEditorNative.runScenario(connector.serviceConnectionId, pluginId, 48000)
             assertTrue(report, report.contains("Result: PASS"))
             project.clips.clear(); project.tracks.clear()
             assertEquals("", project.sync())
         } finally {
-            AraHostSampleNative.closeEditor()
+            SampleEditorNative.closeEditor()
             connector.close()
         }
     }

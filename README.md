@@ -67,6 +67,27 @@ Otherwise, dependencies are resolved via Maven repositories (including Maven Loc
 The latest device verification is recorded in
 [`docs/DEVICE_VERIFICATION.md`](docs/DEVICE_VERIFICATION.md).
 
+## Shared sample editor
+
+`samples/common` owns the editor runtime, Compose UI/model, Android JNI adapter,
+and shared editor tests. Both sample apps consume this directory independently;
+neither app includes sources from the other app. Each app keeps its own launcher,
+and the plugin app owns its plugin implementation, plugin JNI adapter, and service UI.
+
+The common CMake module defines `aap-ara-sample-editor` (the JNI-free native core)
+and `aap-ara-sample-editor-jni` (the Android adapter). A different frontend, such as
+SDL, can link the core and call `sample_editor` with native `Track` and `Clip` rows.
+Supply an AAP connection list and plugin snapshot, keep them alive for the editor
+session, and serialize host calls on one worker thread. Java strings/arrays,
+Binder setup, and Java-side connection lookup stay in `android/sample-editor-jni.cpp`.
+The shared Kotlin API is `org.androidaudioplugin.arasample.SampleEditorNative`.
+
+The plugin's own `aap-ara-plugin-sample.cpp` exposes a JNI-free `sample_plugin`
+interface through its adjacent header. Its `aap-ara-plugin-sample-jni.cpp` adapter
+resolves the service instance and converts Java values. The core resolves opaque
+snapshot tokens, reads JSON snapshots, and applies modification gain edits with
+lifetime checks and synchronization.
+
 ## Project editor
 
 Launch the standalone host sample, tap **Connect**, then **Show plugin UI** to see

@@ -1,4 +1,4 @@
-package org.androidaudioplugin.aaparahostsample
+package org.androidaudioplugin.arasample
 
 import android.content.Context
 import android.media.AudioManager
@@ -66,7 +66,7 @@ class ProjectEditorController private constructor(private val context: Context, 
                 if (connected && !busy && !disposed) {
                     // Only one worker operation may touch the native session.
                     worker.execute {
-                        val updates = AraHostSampleNative.drainPluginUpdates()
+                        val updates = SampleEditorNative.drainPluginUpdates()
                         mainHandler.post { if (!disposed) acceptPluginUpdates(updates) }
                     }
                 }
@@ -110,8 +110,8 @@ class ProjectEditorController private constructor(private val context: Context, 
         disposed = true
         current = null
         worker.execute {
-            if (nativeSessionRequested) AraHostSampleNative.closeEditor()
-            privateBinder?.let { AraHostSampleNative.closePrivateConnection(connector.serviceConnectionId,
+            if (nativeSessionRequested) SampleEditorNative.closeEditor()
+            privateBinder?.let { SampleEditorNative.closePrivateConnection(connector.serviceConnectionId,
                 context.packageName, privateServiceClass, it) }
             if (connectorDelegate.isInitialized()) connector.close()
         }
@@ -132,7 +132,7 @@ class ProjectEditorController private constructor(private val context: Context, 
         if (!connected) { action(); return }
         busy = true
         worker.execute {
-            val updates = AraHostSampleNative.drainPluginUpdates()
+            val updates = SampleEditorNative.drainPluginUpdates()
             mainHandler.post {
                 if (disposed) return@post
                 acceptPluginUpdates(updates)
@@ -199,9 +199,9 @@ class ProjectEditorController private constructor(private val context: Context, 
             val result = runCatching {
                 bindPlugin()
                 nativeSessionRequested = true
-                AraHostSampleNative.openEditor(connector.serviceConnectionId, SAMPLE_PLUGIN_ID, sampleRate())
+                SampleEditorNative.openEditor(connector.serviceConnectionId, SAMPLE_PLUGIN_ID, sampleRate())
             }.getOrElse { it.message ?: "Connection failed" }
-            val instanceId = if (result.isEmpty()) AraHostSampleNative.editorInstanceId() else -1
+            val instanceId = if (result.isEmpty()) SampleEditorNative.editorInstanceId() else -1
             mainHandler.post { if (disposed) return@post; busy = false; connected = result.isEmpty(); pluginInstanceId = instanceId; if (connected) sync() else status = result }
         }
     }
@@ -213,7 +213,7 @@ class ProjectEditorController private constructor(private val context: Context, 
             // workspace a separate Binder endpoint so external hosts cannot replace it.
             if (privateBinder == null) {
                 privateServiceClass = AudioPluginHostHelper.queryAudioPluginService(context, plugin.packageName).className
-                privateBinder = AraHostSampleNative.createPrivateConnection(connector.serviceConnectionId,
+                privateBinder = SampleEditorNative.createPrivateConnection(connector.serviceConnectionId,
                     plugin.packageName, privateServiceClass)
             }
             return
@@ -232,7 +232,7 @@ class ProjectEditorController private constructor(private val context: Context, 
         worker.execute {
             val report = runCatching {
                 if (!connected) bindPlugin()
-                AraHostSampleNative.runScenario(connector.serviceConnectionId, SAMPLE_PLUGIN_ID, sampleRate())
+                SampleEditorNative.runScenario(connector.serviceConnectionId, SAMPLE_PLUGIN_ID, sampleRate())
             }.getOrElse { "Scenario failed:\n${it.stackTraceToString()}" }
             mainHandler.post { if (disposed) return@post; busy = false; status = report }
         }
