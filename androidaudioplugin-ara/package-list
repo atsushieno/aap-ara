@@ -1,0 +1,8 @@
+$dokka.format:html-v1
+$dokka.linkExtension:html
+$dokka.location:org.androidaudioplugin.ara////PointingToDeclaration/androidaudioplugin-ara/org.androidaudioplugin.ara/index.html
+$dokka.location:org.androidaudioplugin.ara/AraAudioPluginServiceExtension///PointingToDeclaration/androidaudioplugin-ara/org.androidaudioplugin.ara/-ara-audio-plugin-service-extension/index.html
+$dokka.location:org.androidaudioplugin.ara/AraAudioPluginServiceExtension/AraAudioPluginServiceExtension/#/PointingToDeclaration/androidaudioplugin-ara/org.androidaudioplugin.ara/-ara-audio-plugin-service-extension/-ara-audio-plugin-service-extension.html
+$dokka.location:org.androidaudioplugin.ara/AraAudioPluginServiceExtension/cleanup/#/PointingToDeclaration/androidaudioplugin-ara/org.androidaudioplugin.ara/-ara-audio-plugin-service-extension/cleanup.html
+$dokka.location:org.androidaudioplugin.ara/AraAudioPluginServiceExtension/initialize/#android.content.Context/PointingToDeclaration/androidaudioplugin-ara/org.androidaudioplugin.ara/-ara-audio-plugin-service-extension/initialize.html
+org.androidaudioplugin.ara
