@@ -173,7 +173,7 @@ std::string sample_editor::runScenario(aap::PluginClientConnectionList* connecti
             return message;
         }
 
-        auto* instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(result.value));
+        auto* instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstance(pluginIdString.c_str(), result.value));
         if (!instance) {
             client.reset();
             return "Plugin instance was created but could not be resolved.";
@@ -459,7 +459,7 @@ std::string sample_editor::openEditor(aap::PluginClientConnectionList* connectio
         session->client = std::make_unique<aap::PluginClient>(connections, &list, registry);
         auto result = session->client->createInstance(pluginId, true);
         if (!result.error.empty()) throw std::runtime_error(result.error);
-        session->instance = dynamic_cast<aap::RemotePluginInstance*>(session->client->getInstanceById(result.value));
+        session->instance = dynamic_cast<aap::RemotePluginInstance*>(session->client->getInstance(pluginId.c_str(), result.value));
         if (!session->instance) throw std::runtime_error("No remote plugin instance");
         session->plugin = session->instance->getPlugin();
         auto* transport = static_cast<aap_ara_extension_t*>(session->plugin->get_extension(session->plugin, AAP_ARA_EXTENSION_URI));

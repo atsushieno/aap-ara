@@ -52,7 +52,7 @@ public:
         auto d = std::make_unique<RemoteDocument>(*client);
         auto result = client->createInstance(pluginID, true);
         if (!result.error.empty()) throw std::runtime_error(result.error);
-        d->instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(result.value));
+        d->instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstance(pluginID.c_str(), result.value));
         if (!d->instance) throw std::runtime_error("No AAP instance");
         auto* initiator = d->instance->getAAPXSDispatcher().getPluginAAPXSByUri(AAP_ARA_EXTENSION_URI);
         if (!initiator) throw std::runtime_error("Missing ARA extension");
